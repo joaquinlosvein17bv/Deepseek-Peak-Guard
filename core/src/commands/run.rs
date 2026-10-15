@@ -231,16 +231,31 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
                         let active_sessions = ticker_session_reg.get_active_sessions_for_schedule(sched_id, &ticker_registry);
                         for sess in active_sessions {
                             info!(
-                                "EMITIENDO STOP NATIVO: Sesión activa '{}' (cliente '{}', modelo '{}') detenida por inicio de horario peak.",
-                                sess.session_id, sess.client_type, sess.model
+                                "EMITIENDO STOP NATIVO: Sesión activa '{}' (instancia '{}', cliente '{}', modelo '{}') detenida por inicio de horario peak.",
+                                sess.session_id, sess.client_instance_id, sess.client_type, sess.model
                             );
+                            let cmd = ticker_session_reg.get_command_manager().create_command(
+                                &sess.client_type,
+                                &sess.client_instance_id,
+                                &sess.session_id,
+                                sess.turn_id.clone(),
+                                &sess.provider_id,
+                                &sess.model,
+                                &transition_str,
+                                "Horario peak iniciado. Cancelando turno activo mediante Stop nativo sin cerrar aplicación.",
+                            );
+
                             let _ = ticker_event_tx.send(format!(
-                                "{{\"type\":\"stop_requested\",\"session_id\":\"{}\",\"turn_id\":{},\"provider_id\":\"{}\",\"model\":\"{}\",\"transition_utc\":\"{}\",\"reason\":\"Horario peak iniciado. Cancelando turno activo mediante Stop nativo sin cerrar aplicación.\"}}",
-                                sess.session_id,
-                                sess.turn_id.as_ref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
-                                sess.provider_id,
-                                sess.model,
-                                transition_str
+                                "{{\"type\":\"stop_requested\",\"command_id\":\"{}\",\"client_type\":\"{}\",\"client_instance_id\":\"{}\",\"session_id\":\"{}\",\"turn_id\":{},\"provider_id\":\"{}\",\"model\":\"{}\",\"transition_utc\":\"{}\",\"reason\":\"{}\"}}",
+                                cmd.command_id,
+                                cmd.client_type,
+                                cmd.client_instance_id,
+                                cmd.session_id,
+                                cmd.turn_id.as_ref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
+                                cmd.provider_id,
+                                cmd.model,
+                                cmd.transition_utc,
+                                cmd.reason
                             ));
                         }
                     }

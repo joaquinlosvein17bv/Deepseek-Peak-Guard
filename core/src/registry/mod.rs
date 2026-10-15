@@ -215,7 +215,10 @@ use std::sync::RwLock;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSession {
     pub session_id: String,
+    #[serde(default = "default_client_type")]
     pub client_type: String, // "opencode", "pi", "hermes"
+    #[serde(default = "default_client_instance_id")]
+    pub client_instance_id: String, // ID estable y único por proceso/instancia
     #[serde(default)]
     pub turn_id: Option<String>,
     #[serde(alias = "provider")]
@@ -227,15 +230,246 @@ pub struct ActiveSession {
     pub is_active: bool,
     #[serde(default = "Utc::now")]
     pub last_heartbeat: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
+    pub registered_at: DateTime<Utc>,
+}
+
+fn default_client_type() -> String {
+    "unknown".to_string()
+}
+
+fn default_client_instance_id() -> String {
+    "default_instance".to_string()
 }
 
 fn default_active() -> bool {
     true
 }
 
+impl ActiveSession {
+    /// Identidad compuesta de sesión (T18.1.2)
+    pub fn composite_key(&self) -> String {
+        format!("{}:{}:{}", self.client_type, self.client_instance_id, self.session_id)
+    }
+
+    pub fn new(
+        session_id: impl Into<String>,
+        client_type: impl Into<String>,
+        client_instance_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            client_type: client_type.into(),
+            client_instance_id: client_instance_id.into(),
+            turn_id: None,
+            provider_id: provider_id.into(),
+            model: model.into(),
+            schedule_id: None,
+            is_active: true,
+            last_heartbeat: Utc::now(),
+            registered_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopCommandStatus {
+    Pending,
+    Acknowledged,
+    Failed,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopCommand {
+    pub command_id: String,
+    pub client_type: String,
+    pub client_instance_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    pub provider_id: String,
+    pub model: String,
+    pub transition_utc: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub status: StopCommandStatus,
+    #[serde(default)]
+    pub acked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ack_success: Option<bool>,
+    #[serde(default)]
+    pub ack_error: Option<String>,
+}
+
 #[derive(Default)]
+pub struct StopCommandManager {
+    commands: RwLock<HashMap<String, StopCommand>>,
+}
+
+impl StopCommandManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn create_command(
+        &self,
+        client_type: &str,
+        client_instance_id: &str,
+        session_id: &str,
+        turn_id: Option<String>,
+        provider_id: &str,
+        model: &str,
+        transition_utc: &str,
+        reason: &str,
+    ) -> StopCommand {
+        let command_id = format!(
+            "cmd_{}_{}_{}",
+            Utc::now().timestamp_millis(),
+            client_instance_id,
+            session_id
+        );
+        let cmd = StopCommand {
+            command_id: command_id.clone(),
+            client_type: client_type.to_string(),
+            client_instance_id: client_instance_id.to_string(),
+            session_id: session_id.to_string(),
+            turn_id,
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            transition_utc: transition_utc.to_string(),
+            reason: reason.to_string(),
+            created_at: Utc::now(),
+            status: StopCommandStatus::Pending,
+            acked_at: None,
+            ack_success: None,
+            ack_error: None,
+        };
+        let mut map = self.commands.write().unwrap();
+        map.insert(command_id, cmd.clone());
+        cmd
+    }
+
+    pub fn get_pending_commands_for_instance(&self, client_instance_id: &str) -> Vec<StopCommand> {
+        let map = self.commands.read().unwrap();
+        map.values()
+            .filter(|c| c.client_instance_id == client_instance_id && c.status == StopCommandStatus::Pending)
+            .cloned()
+            .collect()
+    }
+
+    pub fn record_ack(
+        &self,
+        command_id: Option<&str>,
+        client_instance_id: Option<&str>,
+        session_id: &str,
+        turn_id: Option<&str>,
+        success: bool,
+        error: Option<String>,
+    ) -> Result<StopCommand, String> {
+        let mut map = self.commands.write().unwrap();
+
+        // 1. Si viene command_id explícito, validar pertenencia e idempotencia
+        if let Some(cid) = command_id {
+            if let Some(cmd) = map.get_mut(cid) {
+                if let Some(inst_id) = client_instance_id {
+                    if !cmd.client_instance_id.is_empty()
+                        && cmd.client_instance_id != "default_instance"
+                        && cmd.client_instance_id != inst_id
+                    {
+                        return Err(format!(
+                            "Instancia no autorizada: command_id '{}' pertenece a '{}', pero fue respondido por '{}'",
+                            cid, cmd.client_instance_id, inst_id
+                        ));
+                    }
+                }
+                if cmd.session_id != session_id {
+                    return Err(format!(
+                        "Sesión discordante: command_id '{}' pertenece a sesión '{}', pero fue respondido para '{}'",
+                        cid, cmd.session_id, session_id
+                    ));
+                }
+
+                // Idempotencia: si ya fue confirmado, retornar estado sin duplicar acciones
+                if cmd.status == StopCommandStatus::Acknowledged || cmd.status == StopCommandStatus::Failed {
+                    return Ok(cmd.clone());
+                }
+
+                cmd.status = if success {
+                    StopCommandStatus::Acknowledged
+                } else {
+                    StopCommandStatus::Failed
+                };
+                cmd.acked_at = Some(Utc::now());
+                cmd.ack_success = Some(success);
+                cmd.ack_error = error;
+                return Ok(cmd.clone());
+            } else {
+                return Err(format!("Comando con command_id '{}' no encontrado en el registro", cid));
+            }
+        }
+
+        // 2. Si no viene command_id, buscar comando pendiente coincidente
+        let found_id = map
+            .values()
+            .find(|c| {
+                c.status == StopCommandStatus::Pending
+                    && c.session_id == session_id
+                    && client_instance_id.map(|inst| c.client_instance_id == inst).unwrap_or(true)
+                    && (turn_id.is_none() || c.turn_id.as_deref() == turn_id)
+            })
+            .map(|c| c.command_id.clone());
+
+        if let Some(cid) = found_id {
+            let cmd = map.get_mut(&cid).unwrap();
+            cmd.status = if success {
+                StopCommandStatus::Acknowledged
+            } else {
+                StopCommandStatus::Failed
+            };
+            cmd.acked_at = Some(Utc::now());
+            cmd.ack_success = Some(success);
+            cmd.ack_error = error;
+            Ok(cmd.clone())
+        } else {
+            // No hay comando pendiente: registrar acuse seguro para no fallar cliente legacy
+            let fallback_id = format!("ack_legacy_{}", Utc::now().timestamp_millis());
+            let cmd = StopCommand {
+                command_id: fallback_id.clone(),
+                client_type: "unknown".to_string(),
+                client_instance_id: client_instance_id.unwrap_or("default_instance").to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.map(|t| t.to_string()),
+                provider_id: "unknown".to_string(),
+                model: "unknown".to_string(),
+                transition_utc: Utc::now().to_rfc3339(),
+                reason: "Stop ack legacy sin comando previo".to_string(),
+                created_at: Utc::now(),
+                status: if success { StopCommandStatus::Acknowledged } else { StopCommandStatus::Failed },
+                acked_at: Some(Utc::now()),
+                ack_success: Some(success),
+                ack_error: error,
+            };
+            map.insert(fallback_id, cmd.clone());
+            Ok(cmd)
+        }
+    }
+}
+
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<String, ActiveSession>>,
+    command_manager: std::sync::Arc<StopCommandManager>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            command_manager: std::sync::Arc::new(StopCommandManager::new()),
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -243,30 +477,64 @@ impl SessionRegistry {
         Self::default()
     }
 
+    pub fn get_command_manager(&self) -> std::sync::Arc<StopCommandManager> {
+        self.command_manager.clone()
+    }
+
     pub fn register(&self, session: ActiveSession) {
         let mut map = self.sessions.write().unwrap();
-        map.insert(session.session_id.clone(), session);
+        let key = session.composite_key();
+        map.insert(key, session);
     }
 
-    pub fn heartbeat(&self, session_id: &str, turn_id: Option<String>, is_active: Option<bool>) -> bool {
+    pub fn heartbeat(
+        &self,
+        client_instance_id: Option<&str>,
+        session_id: &str,
+        turn_id: Option<String>,
+        is_active: Option<bool>,
+    ) -> bool {
         let mut map = self.sessions.write().unwrap();
-        if let Some(sess) = map.get_mut(session_id) {
-            sess.last_heartbeat = Utc::now();
-            if let Some(t) = turn_id {
-                sess.turn_id = Some(t);
+        // 1. Si viene client_instance_id, buscar coincidencia exacta
+        if let Some(inst_id) = client_instance_id {
+            for s in map.values_mut() {
+                if s.session_id == session_id && s.client_instance_id == inst_id {
+                    s.last_heartbeat = Utc::now();
+                    if let Some(t) = turn_id {
+                        s.turn_id = Some(t);
+                    }
+                    if let Some(active) = is_active {
+                        s.is_active = active;
+                    }
+                    return true;
+                }
             }
-            if let Some(active) = is_active {
-                sess.is_active = active;
-            }
-            true
-        } else {
-            false
         }
+
+        // 2. Fallback por session_id
+        for s in map.values_mut() {
+            if s.session_id == session_id {
+                s.last_heartbeat = Utc::now();
+                if let Some(t) = turn_id {
+                    s.turn_id = Some(t);
+                }
+                if let Some(active) = is_active {
+                    s.is_active = active;
+                }
+                return true;
+            }
+        }
+
+        false
     }
 
-    pub fn unregister(&self, session_id: &str) {
+    pub fn unregister(&self, client_instance_id: Option<&str>, session_id: &str) {
         let mut map = self.sessions.write().unwrap();
-        map.remove(session_id);
+        if let Some(inst_id) = client_instance_id {
+            map.retain(|_, s| !(s.session_id == session_id && s.client_instance_id == inst_id));
+        } else {
+            map.retain(|_, s| s.session_id != session_id);
+        }
     }
 
     pub fn get_active_sessions_for_schedule(
@@ -280,12 +548,45 @@ impl SessionRegistry {
             .filter(|s| {
                 if let Some(provider) = registry.get_provider_for_model(&s.model) {
                     provider.schedule_id == schedule_id
+                } else if !s.provider_id.is_empty() {
+                    if let Some(p) = registry.get_providers().get(&s.provider_id) {
+                        p.schedule_id == schedule_id
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
             })
             .cloned()
             .collect()
+    }
+
+    /// Retorna sesiones activas filtradas específicamente por proveedor (T18.1.1)
+    pub fn get_active_sessions_for_provider(
+        &self,
+        provider_id: &str,
+        registry: &ModelRegistry,
+    ) -> Vec<ActiveSession> {
+        let map = self.sessions.read().unwrap();
+        map.values()
+            .filter(|s| s.is_active)
+            .filter(|s| {
+                if s.provider_id == provider_id {
+                    return true;
+                }
+                if let Some(p) = registry.get_provider_for_model(&s.model) {
+                    return p.id == provider_id;
+                }
+                false
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Cuenta sesiones activas específicas para un proveedor
+    pub fn count_active_for_provider(&self, provider_id: &str, registry: &ModelRegistry) -> usize {
+        self.get_active_sessions_for_provider(provider_id, registry).len()
     }
 
     pub fn count_active(&self) -> usize {
@@ -299,10 +600,8 @@ impl SessionRegistry {
         map.retain(|_, s| {
             let elapsed = now - s.last_heartbeat;
             if s.is_active {
-                // Durante turnos activos de razonamiento, permitir hasta active_max_silence (ej. 30 min)
                 elapsed < active_max_silence
             } else {
-                // Sesiones inactivas o finalizadas: podar tras inactive_timeout (ej. 60s)
                 elapsed < inactive_timeout
             }
         });
@@ -322,25 +621,122 @@ mod tests {
         registry.register(ActiveSession {
             session_id: "s1".to_string(),
             client_type: "opencode".to_string(),
+            client_instance_id: "inst_1".to_string(),
             turn_id: Some("t1".to_string()),
             provider_id: "deepseek_direct".to_string(),
             model: "deepseek-chat".to_string(),
             schedule_id: Some("deepseek_direct_verified".to_string()),
             is_active: true,
             last_heartbeat: Utc::now(),
+            registered_at: Utc::now(),
         });
         assert_eq!(registry.count_active(), 1);
 
-        // Heartbeat
-        let updated = registry.heartbeat("s1", Some("t2".to_string()), Some(true));
+        // Heartbeat con client_instance_id
+        let updated = registry.heartbeat(Some("inst_1"), "s1", Some("t2".to_string()), Some(true));
         assert!(updated);
 
         // Heartbeat para sesión inexistente
-        assert!(!registry.heartbeat("nonexistent", None, None));
+        assert!(!registry.heartbeat(None, "nonexistent", None, None));
 
         // Desregistrar sesión
-        registry.unregister("s1");
+        registry.unregister(Some("inst_1"), "s1");
         assert_eq!(registry.count_active(), 0);
+    }
+
+    #[test]
+    fn test_composite_identity_isolation() {
+        // T18.1.2: Dos clientes o instancias con el mismo session_id ("session_common")
+        // NO deben sobreescribirse entre sí gracias a la clave compuesta.
+        let registry = SessionRegistry::new();
+
+        let s_a = ActiveSession::new("session_common", "opencode", "inst_alpha", "deepseek_direct", "deepseek-chat");
+        let s_b = ActiveSession::new("session_common", "opencode", "inst_beta", "deepseek_direct", "deepseek-chat");
+
+        registry.register(s_a);
+        registry.register(s_b);
+
+        // Ambas deben estar activas y no haber colisionado
+        assert_eq!(registry.count_active(), 2);
+
+        // Heartbeat a inst_alpha solo afecta a inst_alpha
+        assert!(registry.heartbeat(Some("inst_alpha"), "session_common", Some("turn_a1".to_string()), Some(true)));
+
+        // Unregister de inst_alpha no debe borrar inst_beta
+        registry.unregister(Some("inst_alpha"), "session_common");
+        assert_eq!(registry.count_active(), 1);
+
+        // inst_beta sigue activa
+        assert!(registry.heartbeat(Some("inst_beta"), "session_common", None, None));
+    }
+
+    #[test]
+    fn test_stop_command_manager_lifecycle() {
+        // T18.1.3: Registro y recuperación de comandos Stop
+        let mgr = StopCommandManager::new();
+
+        // 1. Crear comando Stop
+        let cmd = mgr.create_command(
+            "pi",
+            "inst_pi_99",
+            "sess_42",
+            Some("turn_9".to_string()),
+            "deepseek_direct",
+            "deepseek-reasoner",
+            &Utc::now().to_rfc3339(),
+            "Entrada en pico",
+        );
+
+        assert_eq!(cmd.status, StopCommandStatus::Pending);
+        assert_eq!(cmd.client_instance_id, "inst_pi_99");
+
+        // 2. Recuperar pendientes para inst_pi_99
+        let pending = mgr.get_pending_commands_for_instance("inst_pi_99");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command_id, cmd.command_id);
+
+        // Para otra instancia no debe haber pendientes
+        let pending_other = mgr.get_pending_commands_for_instance("inst_other");
+        assert_eq!(pending_other.len(), 0);
+
+        // 3. Intento de ACK por instancia ajena debe fallar (403 / Err)
+        let foreign_ack = mgr.record_ack(
+            Some(&cmd.command_id),
+            Some("inst_imposter"),
+            "sess_42",
+            Some("turn_9"),
+            true,
+            None,
+        );
+        assert!(foreign_ack.is_err(), "ACK de instancia ajena debe ser rechazado");
+
+        // 4. ACK válido por la instancia legítima
+        let valid_ack = mgr.record_ack(
+            Some(&cmd.command_id),
+            Some("inst_pi_99"),
+            "sess_42",
+            Some("turn_9"),
+            true,
+            None,
+        );
+        assert!(valid_ack.is_ok());
+        let acked_cmd = valid_ack.unwrap();
+        assert_eq!(acked_cmd.status, StopCommandStatus::Acknowledged);
+
+        // Ya no debe aparecer como pendiente
+        let pending_after = mgr.get_pending_commands_for_instance("inst_pi_99");
+        assert_eq!(pending_after.len(), 0);
+
+        // 5. ACK repetido es idempotente y no falla
+        let dup_ack = mgr.record_ack(
+            Some(&cmd.command_id),
+            Some("inst_pi_99"),
+            "sess_42",
+            Some("turn_9"),
+            true,
+            None,
+        );
+        assert!(dup_ack.is_ok());
     }
 
     #[test]
@@ -351,23 +747,27 @@ mod tests {
         session_reg.register(ActiveSession {
             session_id: "s-deepseek".to_string(),
             client_type: "opencode".to_string(),
+            client_instance_id: "inst_1".to_string(),
             turn_id: Some("t1".to_string()),
             provider_id: "deepseek_direct".to_string(),
             model: "deepseek-chat".to_string(),
             schedule_id: None,
             is_active: true,
             last_heartbeat: Utc::now(),
+            registered_at: Utc::now(),
         });
 
         session_reg.register(ActiveSession {
             session_id: "s-go".to_string(),
             client_type: "opencode".to_string(),
+            client_instance_id: "inst_1".to_string(),
             turn_id: Some("t2".to_string()),
             provider_id: "opencode_go".to_string(),
             model: "deepseek-v4.1-flash".to_string(),
             schedule_id: None,
             is_active: true,
             last_heartbeat: Utc::now(),
+            registered_at: Utc::now(),
         });
 
         // Filtrar sesiones para deepseek_direct_verified
@@ -394,24 +794,28 @@ mod tests {
         registry.register(ActiveSession {
             session_id: "active-reasoning-session".to_string(),
             client_type: "pi".to_string(),
+            client_instance_id: "inst_pi_1".to_string(),
             turn_id: Some("turn-r1".to_string()),
             provider_id: "deepseek_direct".to_string(),
             model: "deepseek-reasoner".to_string(),
             schedule_id: None,
             is_active: true,
             last_heartbeat: old_time,
+            registered_at: old_time,
         });
 
         // Sesión inactiva (finalizada)
         registry.register(ActiveSession {
             session_id: "inactive-stale-session".to_string(),
             client_type: "opencode".to_string(),
+            client_instance_id: "inst_oc_1".to_string(),
             turn_id: None,
             provider_id: "deepseek_direct".to_string(),
             model: "deepseek-chat".to_string(),
             schedule_id: None,
             is_active: false,
             last_heartbeat: old_time,
+            registered_at: old_time,
         });
 
         assert_eq!(registry.count_active(), 1);

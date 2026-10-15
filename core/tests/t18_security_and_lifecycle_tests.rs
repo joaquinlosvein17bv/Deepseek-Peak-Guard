@@ -270,24 +270,28 @@ fn test_lifecycle_active_reasoning_turn_preserved_across_silence() {
     registry.register(ActiveSession {
         session_id: "reasoning-turn-deepseek-r1".to_string(),
         client_type: "pi".to_string(),
+        client_instance_id: "inst_test_pi".to_string(),
         turn_id: Some("turn-reasoning-1".to_string()),
         provider_id: "deepseek_direct".to_string(),
         model: "deepseek-reasoner".to_string(),
         schedule_id: Some("deepseek_direct_verified".to_string()),
         is_active: true,
         last_heartbeat: old_time,
+        registered_at: old_time,
     });
 
     // 2. Sesión finalizada inactiva
     registry.register(ActiveSession {
         session_id: "idle-finished-session".to_string(),
         client_type: "pi".to_string(),
+        client_instance_id: "inst_test_pi".to_string(),
         turn_id: None,
         provider_id: "deepseek_direct".to_string(),
         model: "deepseek-chat".to_string(),
         schedule_id: Some("deepseek_direct_verified".to_string()),
         is_active: false,
         last_heartbeat: old_time,
+        registered_at: old_time,
     });
 
     assert_eq!(registry.count_active(), 1);

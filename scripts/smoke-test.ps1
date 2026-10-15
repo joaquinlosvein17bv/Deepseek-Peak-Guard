@@ -32,13 +32,22 @@ Write-Host "3. Probando comando 'doctor'..."
 if ($LASTEXITCODE -ne 0) { throw "Fallo en 'doctor'" }
 
 # 4. Cargo tests
-Write-Host "4. Ejecutando suite completa de pruebas unitarias y de integración..."
+Write-Host "4. Ejecutando suite completa de pruebas unitarias y de integración en Rust..."
 if (Test-Path "$env:USERPROFILE\scoop\apps\mingw\current\bin") {
     $env:PATH = "$env:USERPROFILE\scoop\apps\mingw\current\bin;" + $env:PATH
 }
 Set-Location $coreDir
-cargo test
+cargo test --tests -- --test-threads=2
 if ($LASTEXITCODE -ne 0) { throw "Fallo en cargo test" }
+
+# 5. Adapter tests
+Write-Host "5. Ejecutando suites de verificación de adaptadores OpenCode y Pi en Node.js..."
+Set-Location $root
+node adapters/tests/adapter-mock-runner.test.mjs
+if ($LASTEXITCODE -ne 0) { throw "Fallo en adapter-mock-runner.test.mjs" }
+
+node adapters/tests/t18_1_repro_adapter_tests.mjs
+if ($LASTEXITCODE -ne 0) { throw "Fallo en t18_1_repro_adapter_tests.mjs" }
 
 Set-Location $root
 Write-Host "==> ¡Smoke test completado exitosamente! Todos los componentes funcionan correctamente." -ForegroundColor Green

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 pub struct ControlApiState {
@@ -49,6 +49,10 @@ pub struct StatusResponse {
 
 #[derive(Deserialize)]
 pub struct StopAckRequest {
+    #[serde(default)]
+    pub command_id: Option<String>,
+    #[serde(default)]
+    pub client_instance_id: Option<String>,
     pub session_id: String,
     #[serde(default)]
     pub turn_id: Option<String>,
@@ -65,6 +69,8 @@ pub struct SetModeRequest {
 
 #[derive(Deserialize)]
 pub struct SessionHeartbeatRequest {
+    #[serde(default)]
+    pub client_instance_id: Option<String>,
     pub session_id: String,
     #[serde(default)]
     pub turn_id: Option<String>,
@@ -74,7 +80,14 @@ pub struct SessionHeartbeatRequest {
 
 #[derive(Deserialize)]
 pub struct SessionUnregisterRequest {
+    #[serde(default)]
+    pub client_instance_id: Option<String>,
     pub session_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct PendingCommandsQuery {
+    pub client_instance_id: String,
 }
 
 pub fn create_control_router(state: ControlApiState) -> Router {
@@ -82,6 +95,7 @@ pub fn create_control_router(state: ControlApiState) -> Router {
         .route("/api/v1/health", get(handle_health))
         .route("/api/v1/status", get(handle_status))
         .route("/api/v1/events", get(handle_events))
+        .route("/api/v1/adapters/commands/pending", get(handle_pending_commands))
         .route("/api/v1/adapters/stop-ack", post(handle_stop_ack))
         .route("/api/v1/config/mode", put(handle_set_mode))
         .route("/api/v1/sessions/register", post(handle_session_register))
@@ -154,6 +168,9 @@ async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusRespo
             let go_provider = providers.get("opencode_go");
             let go_enabled = go_provider.map(|p| p.enabled).unwrap_or(false);
 
+            let direct_active_sessions = state
+                .session_registry
+                .count_active_for_provider("deepseek_direct", &state.registry);
             let direct_traffic_observed = traffic.has_observed_provider("deepseek_direct");
 
             // OpenCode Go gestiona inferencia nativamente y no pasa por el gateway por defecto
@@ -168,14 +185,16 @@ async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusRespo
                     }),
                 )
             } else if direct_enabled {
-                // Solo declarar PROTECTED si el gateway ha intermediado tráfico real o hay sesión activa conectada
-                if direct_traffic_observed || active_sessions > 0 {
+                // T18.1.1: Solo declarar PROTECTED si el gateway ha intermediado tráfico real de DeepSeek
+                // o hay sesión activa conectada ESPECÍFICAMENTE de DeepSeek (no de Claude, GPT u otros)
+                if direct_traffic_observed || direct_active_sessions > 0 {
                     (
                         "PROTECTED".to_string(),
                         serde_json::json!({
                             "verified_route": "deepseek_direct",
-                            "observed_requests": total_observed,
-                            "active_sessions": active_sessions,
+                            "observed_requests_for_deepseek": total_observed,
+                            "active_sessions_for_deepseek": direct_active_sessions,
+                            "total_active_sessions": active_sessions,
                             "gateway_operational": true,
                         }),
                     )
@@ -185,8 +204,9 @@ async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusRespo
                         serde_json::json!({
                             "reason": "route_configured_awaiting_first_observed_request",
                             "configured_route": "deepseek_direct",
-                            "observed_requests": 0,
-                            "active_sessions": 0,
+                            "observed_requests_for_deepseek": 0,
+                            "active_sessions_for_deepseek": 0,
+                            "total_active_sessions": active_sessions,
                             "gateway_operational": true,
                         }),
                     )
@@ -232,6 +252,31 @@ async fn handle_stop_ack(
             .into_response();
     }
 
+    let cmd_mgr = state.session_registry.get_command_manager();
+    let ack_res = cmd_mgr.record_ack(
+        payload.command_id.as_deref(),
+        payload.client_instance_id.as_deref(),
+        &payload.session_id,
+        payload.turn_id.as_deref(),
+        payload.success,
+        payload.error.clone(),
+    );
+
+    let recorded_cmd = match ack_res {
+        Ok(c) => c,
+        Err(err_msg) => {
+            warn!("Rechazo de Stop ACK por discordancia o falta de autorización: {}", err_msg);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": err_msg,
+                    "session_id": payload.session_id
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let key = StopKey {
         session_id: payload.session_id.clone(),
         turn_id: payload.turn_id.clone().unwrap_or_else(|| "default".to_string()),
@@ -240,8 +285,8 @@ async fn handle_stop_ack(
 
     if payload.success {
         info!(
-            "Stop ACK exitoso confirmado por adaptador: session_id='{}', turn_id='{:?}'",
-            payload.session_id, payload.turn_id
+            "Stop ACK exitoso confirmado por adaptador: cmd='{}', session_id='{}', turn_id='{:?}'",
+            recorded_cmd.command_id, payload.session_id, payload.turn_id
         );
         state.policy_engine.acknowledge_stop(key);
         (
@@ -249,17 +294,19 @@ async fn handle_stop_ack(
             Json(serde_json::json!({
                 "status": "acknowledged",
                 "success": true,
+                "command_id": recorded_cmd.command_id,
                 "session_id": payload.session_id
             })),
         )
             .into_response()
     } else {
         warn!(
-            "Stop ACK con FALLO reportado por adaptador: session_id='{}', error='{:?}'. Stop NO será marcado como exitoso.",
-            payload.session_id, payload.error
+            "Stop ACK con FALLO reportado por adaptador: cmd='{}', session_id='{}', error='{:?}'. Stop NO será marcado como exitoso.",
+            recorded_cmd.command_id, payload.session_id, payload.error
         );
         let _ = state.event_tx.send(format!(
-            "{{\"type\":\"stop_failed\",\"session_id\":\"{}\",\"error\":\"{}\"}}",
+            "{{\"type\":\"stop_failed\",\"command_id\":\"{}\",\"session_id\":\"{}\",\"error\":\"{}\"}}",
+            recorded_cmd.command_id,
             payload.session_id,
             payload.error.unwrap_or_else(|| "Abort failed".to_string())
         ));
@@ -268,12 +315,33 @@ async fn handle_stop_ack(
             Json(serde_json::json!({
                 "status": "failed",
                 "success": false,
+                "command_id": recorded_cmd.command_id,
                 "session_id": payload.session_id,
                 "fallback": "gateway_cancel"
             })),
         )
             .into_response()
     }
+}
+
+async fn handle_pending_commands(
+    State(state): State<ControlApiState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<PendingCommandsQuery>,
+) -> Response {
+    if !check_auth(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
+    }
+    let cmd_mgr = state.session_registry.get_command_manager();
+    let commands = cmd_mgr.get_pending_commands_for_instance(&query.client_instance_id);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "client_instance_id": query.client_instance_id,
+            "commands": commands
+        })),
+    )
+        .into_response()
 }
 
 async fn handle_set_mode(
@@ -331,6 +399,7 @@ async fn handle_session_heartbeat(
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
     let updated = state.session_registry.heartbeat(
+        payload.client_instance_id.as_deref(),
         &payload.session_id,
         payload.turn_id,
         payload.is_active,
@@ -358,7 +427,11 @@ async fn handle_session_unregister(
     if !check_auth(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
-    state.session_registry.unregister(&payload.session_id);
+    info!(
+        "Sesión desregistrada en Control API: id='{}', inst='{:?}'",
+        payload.session_id, payload.client_instance_id
+    );
+    state.session_registry.unregister(payload.client_instance_id.as_deref(), &payload.session_id);
     (
         StatusCode::OK,
         Json(serde_json::json!({ "status": "unregistered" })),
@@ -426,10 +499,28 @@ pub fn resolve_or_create_control_token(token_env_var: &str) -> Result<String, Bo
         Err(_) => std::path::PathBuf::from(".peakguard"),
     };
     let token_file = token_dir.join("control.token");
-    if let Ok(content) = std::fs::read_to_string(&token_file) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+    
+    // T18.1.5: Distinguir archivo inexistente (NotFound) de errores de lectura/permisos
+    match std::fs::read_to_string(&token_file) {
+        Ok(content) => {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            } else {
+                return Err(format!(
+                    "Archivo de token existente está vacío ('{}'). Requiere corrección o eliminación manual (fail-closed).",
+                    token_file.display()
+                ).into());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // El archivo genuinamente no existe: política explícita de creación inicial
+            info!("Archivo de token no existe en '{}'. Creando token nuevo de forma segura...", token_file.display());
+        }
+        Err(e) => {
+            // Error de permisos, bloqueo u otro: FALLAR CERRADO, nunca sobrescribir credencial existente
+            error!("Error de I/O o permisos accediendo a '{}': {}", token_file.display(), e);
+            return Err(format!("Error accediendo al archivo de token existente ('{}'): {}", token_file.display(), e).into());
         }
     }
 

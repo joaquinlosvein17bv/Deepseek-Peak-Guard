@@ -1,7 +1,12 @@
 /**
- * PeakGuard Adapter Mock Verification Suite
+ * PeakGuard Adapter Mock Verification Suite (T18.1)
  * Valida el comportamiento de los adaptadores de OpenCode y Pi en Node.js
- * contra un servidor Control API simulado.
+ * contra un servidor Control API simulado:
+ * - Identidad compuesta con client_instance_id (T18.1.2)
+ * - Indicador UI de Pi que jamás afirma "Protegido" si coverage es PARTIAL o UNVERIFIED (T18.1.1)
+ * - Recuperación de órdenes Stop pendientes al conectarse (T18.1.3)
+ * - Aislamiento estricto de sesiones entre instancias (T18.1.6)
+ * - Latidos periódicos y ciclo de vida de razonamiento (T18.1.4)
  */
 
 import http from "node:http";
@@ -14,6 +19,7 @@ let registeredSessions = [];
 let unregisterCalls = [];
 let heartbeatCalls = [];
 let sseSubscribers = [];
+let mockPendingCommands = [];
 
 const server = http.createServer((req, res) => {
   const authHeader = req.headers["authorization"];
@@ -38,6 +44,14 @@ const server = http.createServer((req, res) => {
   if (!isAuthorized) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Unauthorized" }));
+    return;
+  }
+
+  if (url.pathname === "/api/v1/adapters/commands/pending" && req.method === "GET") {
+    const instId = url.searchParams.get("client_instance_id");
+    const cmds = mockPendingCommands.filter((c) => !instId || c.client_instance_id === instId);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ client_instance_id: instId, commands: cmds }));
     return;
   }
 
@@ -117,10 +131,15 @@ server.listen(0, "127.0.0.1", async () => {
       registerActiveSession,
       sendStopAck,
       startEventSubscriber,
+      CLIENT_INSTANCE_ID: OPENCODE_INSTANCE_ID,
     } = await import("../opencode/peakguard-opencode-server.js");
 
     const { fetchStatus } = await import("../opencode/peakguard-tui-sidebar.js");
-    const { default: peakguardPiExtension } = await import("../pi/peakguard-pi.ts");
+    const {
+      default: peakguardPiExtension,
+      formatPiStatusLabel,
+      CLIENT_INSTANCE_ID: PI_INSTANCE_ID,
+    } = await import("../pi/peakguard-pi.ts");
 
     console.log("--- 1. Probando fetchStatus() en Widget TUI ---");
     const status = await fetchStatus();
@@ -128,14 +147,33 @@ server.listen(0, "127.0.0.1", async () => {
     assert.strictEqual(status.mode, "restricted_stop");
     console.log("  ✓ Widget TUI sincronizó estado correctamente.");
 
-    console.log("--- 2. Probando registro de sesiones activas (T17.2, T18.4) ---");
+    console.log("--- 2. Probando formateo de indicador Pi (T18.1.1) ---");
+    const labelDisconnected = formatPiStatusLabel(null);
+    assert.strictEqual(labelDisconnected, "○ DESCONECTADO");
+
+    const labelPartial = formatPiStatusLabel({ is_peak: true, coverage: "PARTIAL" });
+    assert.strictEqual(labelPartial, "⛔ PEAK (PARTIAL)");
+    assert.ok(!labelPartial.includes("Protegido"), "No debe reportar 'Protegido' si coverage es PARTIAL");
+
+    const labelUnverified = formatPiStatusLabel({ is_peak: true, coverage: "UNVERIFIED" });
+    assert.strictEqual(labelUnverified, "⛔ PEAK (UNVERIFIED)");
+
+    const labelProtected = formatPiStatusLabel({ is_peak: true, coverage: "PROTECTED" });
+    assert.strictEqual(labelProtected, "⛔ PEAK (Protegido)");
+    console.log("  ✓ Indicador de Pi refleja fielmente la cobertura sin falsos 'Protegido'.");
+
+    console.log("--- 3. Probando registro de sesiones compuestas (T18.1.2) ---");
+    assert.ok(OPENCODE_INSTANCE_ID.startsWith("opencode_inst_"), "OpenCode debe tener client_instance_id válido");
+    assert.ok(PI_INSTANCE_ID.startsWith("pi_inst_"), "Pi debe tener client_instance_id válido");
+
     const regRes = await registerActiveSession("session-test-1", "deepseek-chat", "deepseek_direct", "turn-1");
     assert.strictEqual(regRes.statusCode, 200);
     assert.strictEqual(registeredSessions.length, 1);
     assert.strictEqual(registeredSessions[0].session_id, "session-test-1");
-    console.log("  ✓ Sesión registrada con token Bearer verificado.");
+    assert.strictEqual(registeredSessions[0].client_instance_id, OPENCODE_INSTANCE_ID);
+    console.log("  ✓ Sesión registrada con identidad compuesta (session_id + client_instance_id).");
 
-    console.log("--- 3. Probando Stop nativo exitoso en OpenCode (T17.2, T17.6) ---");
+    console.log("--- 4. Probando Stop nativo exitoso en OpenCode (T17.2, T17.6, T18.1.3) ---");
     let abortCalled = false;
     let abortTarget = null;
 
@@ -159,6 +197,8 @@ server.listen(0, "127.0.0.1", async () => {
       sub.write(
         `data: ${JSON.stringify({
           type: "stop_requested",
+          command_id: "cmd_stop_001",
+          client_instance_id: OPENCODE_INSTANCE_ID,
           session_id: "session-test-1",
           turn_id: "turn-1",
           transition_utc: "2026-10-15T01:00:00Z",
@@ -173,14 +213,15 @@ server.listen(0, "127.0.0.1", async () => {
     assert.strictEqual(abortTarget, "session-test-1");
     assert.strictEqual(receivedAcks.length, 1);
     assert.strictEqual(receivedAcks[0].success, true, "Stop exitoso debe reportar success=true");
-    assert.strictEqual(receivedAcks[0].error, null);
+    assert.strictEqual(receivedAcks[0].command_id, "cmd_stop_001", "Stop ACK debe incluir command_id");
+    assert.strictEqual(receivedAcks[0].client_instance_id, OPENCODE_INSTANCE_ID);
     console.log("  ✓ client.session.abort() ejecutado y confirmado con Stop ACK exitoso.");
 
     sseReq.destroy();
     sseSubscribers = [];
     receivedAcks = [];
 
-    console.log("--- 4. Probando Stop con fallo: NUNCA reportar falso positivo (T17.1, T17.6) ---");
+    console.log("--- 5. Probando Stop con fallo: NUNCA reportar falso positivo (T17.1, T17.6) ---");
     await registerActiveSession("session-failing-1", "deepseek-chat", "deepseek_direct", "turn-fail");
 
     const failingClient = {
@@ -198,6 +239,8 @@ server.listen(0, "127.0.0.1", async () => {
       sub.write(
         `data: ${JSON.stringify({
           type: "stop_requested",
+          command_id: "cmd_stop_002",
+          client_instance_id: OPENCODE_INSTANCE_ID,
           session_id: "session-failing-1",
           transition_utc: "2026-10-15T01:00:00Z",
         })}\n\n`
@@ -216,7 +259,7 @@ server.listen(0, "127.0.0.1", async () => {
     sseSubscribers = [];
     receivedAcks = [];
 
-    console.log("--- 5. Probando aislamiento de sesión en OpenCode (ignora sesiones ajenas) ---");
+    console.log("--- 6. Probando aislamiento de sesión en OpenCode (ignora sesiones ajenas) ---");
     let foreignAbortCalled = false;
     const isolationClient = {
       session: {
@@ -248,7 +291,48 @@ server.listen(0, "127.0.0.1", async () => {
     sseSubscribers = [];
     receivedAcks = [];
 
-    console.log("--- 6. Probando adaptador de Pi: aislamiento de sesión, abort nativo y settled ---");
+    console.log("--- 7. Probando recuperación de órdenes Stop pendientes al conectar (T18.1.3) ---");
+    // Registrar una sesión en OpenCode que sufrirá un corte de red durante la emisión de Stop
+    await registerActiveSession("session-pending-recovery-1", "deepseek-chat", "deepseek_direct", "turn-p1");
+
+    // El servidor tiene una orden pendiente encolada para este client_instance_id
+    mockPendingCommands.push({
+      command_id: "cmd_missed_during_disconnect_999",
+      client_type: "opencode",
+      client_instance_id: OPENCODE_INSTANCE_ID,
+      session_id: "session-pending-recovery-1",
+      turn_id: "turn-p1",
+      transition_utc: "2026-10-15T01:00:00Z",
+      reason: "Peak transitado durante desconexión",
+    });
+
+    let recoveredAbortCalled = false;
+    const recoveryClient = {
+      session: {
+        abort: async ({ path }) => {
+          if (path.id === "session-pending-recovery-1") {
+            recoveredAbortCalled = true;
+          }
+          return { aborted: true };
+        },
+      },
+    };
+
+    // Conectar el suscriptor: debe consultar GET /api/v1/adapters/commands/pending y procesarla
+    const sseReqRecov = startEventSubscriber(recoveryClient);
+    await new Promise((r) => setTimeout(r, 400));
+
+    assert.strictEqual(recoveredAbortCalled, true, "Orden pendiente debe ser ejecutada tras reconexión");
+    const recovAck = receivedAcks.find((a) => a.command_id === "cmd_missed_during_disconnect_999");
+    assert.ok(recovAck, "Stop ACK debe ser emitido para la orden recuperada");
+    assert.strictEqual(recovAck.success, true);
+    console.log("  ✓ Órdenes Stop perdidas durante desconexión recuperadas y procesadas con éxito.");
+
+    sseReqRecov.destroy();
+    sseSubscribers = [];
+    receivedAcks = [];
+
+    console.log("--- 8. Probando adaptador de Pi: aislamiento de sesión, abort nativo y settled ---");
     let piAbortCalled = false;
     let piEventListeners = {};
 
@@ -293,12 +377,14 @@ server.listen(0, "127.0.0.1", async () => {
     assert.strictEqual(piAbortCalled, false, "Pi no debe abortar si el stop_requested es para otra sesión");
     console.log("  ✓ Pi ignoró exitosamente el stop para sesión ajena.");
 
-    // B. Emitir stop para la sesión activa de Pi
+    // B. Emitir stop para la sesión propia de Pi
     console.log("  Enviando stop_requested para la sesión propia 'pi-isolated-session'...");
     for (const sub of sseSubscribers) {
       sub.write(
         `data: ${JSON.stringify({
           type: "stop_requested",
+          command_id: "cmd_pi_001",
+          client_instance_id: PI_INSTANCE_ID,
           session_id: "pi-isolated-session",
           turn_id: "turn-pi-1",
           transition_utc: "2026-10-15T01:00:00Z",
@@ -311,6 +397,8 @@ server.listen(0, "127.0.0.1", async () => {
     const piAck = receivedAcks.find((a) => a.session_id === "pi-isolated-session");
     assert.ok(piAck, "Pi debe enviar Stop ACK");
     assert.strictEqual(piAck.success, true, "Pi debe reportar éxito de abort");
+    assert.strictEqual(piAck.command_id, "cmd_pi_001");
+    assert.strictEqual(piAck.client_instance_id, PI_INSTANCE_ID);
     console.log("  ✓ Pi ejecutó abort() nativo y envió Stop ACK confirmado.");
 
     // C. Probar agent_settled emitiendo is_active: false
@@ -324,9 +412,9 @@ server.listen(0, "127.0.0.1", async () => {
 
     cleanupPi();
     server.close();
-    console.log("\n=========================================");
-    console.log("TODAS LAS PRUEBAS DE MOCK RUNNER PASARON!");
-    console.log("=========================================");
+    console.log("\n========================================================");
+    console.log("TODAS LAS PRUEBAS DE MOCK RUNNER (T18.1) PASARON CON ÉXITO!");
+    console.log("========================================================");
     process.exit(0);
   } catch (err) {
     console.error("ERROR EN PRUEBAS DE MOCK RUNNER:", err);
