@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -19,6 +20,7 @@ pub struct GatewayState {
     pub registry: Arc<ModelRegistry>,
     pub clock: Arc<dyn Clock>,
     pub http_client: reqwest::Client,
+    pub event_tx: Option<tokio::sync::broadcast::Sender<String>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -114,7 +116,22 @@ async fn handle_chat_completions(
             reason,
             next_off_peak_utc,
         } => (reason, next_off_peak_utc),
-        PolicyDecision::StopRequired { reason, .. } => (reason, None),
+        PolicyDecision::StopRequired {
+            reason,
+            session_id: sess_id,
+            turn_id,
+        } => {
+            if let Some(ref tx) = state.event_tx {
+                let _ = tx.send(format!(
+                    "{{\"type\":\"stop_requested\",\"session_id\":\"{}\",\"turn_id\":{},\"transition_utc\":\"{}\",\"reason\":\"{}\"}}",
+                    sess_id,
+                    turn_id.as_ref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
+                    now.to_rfc3339(),
+                    reason
+                ));
+            }
+            (reason, None)
+        }
         PolicyDecision::Allow | PolicyDecision::NotifyOnly { .. } => {
             // Solicitud permitida: continúa abajo
             (String::new(), None)
@@ -198,13 +215,64 @@ async fn handle_chat_completions(
                 .unwrap_or(false);
 
             if is_sse {
-                let stream_bytes = upstream_resp.bytes_stream();
+                let mut stream_bytes = upstream_resp.bytes_stream();
+                let policy_engine = state.policy_engine.clone();
+                let clock = state.clock.clone();
+                let model = model_name.clone();
+                let event_sender = state.event_tx.clone();
+                let sess_id = session_id.clone();
+
+                let wrapped_stream = async_stream::stream! {
+                    while let Some(item) = stream_bytes.next().await {
+                        // Comprobar política horaria antes de reenviar cada chunk
+                        let now = clock.now();
+                        let decision = policy_engine.evaluate_request(
+                            &model,
+                            sess_id.as_deref(),
+                            None,
+                            now,
+                            true,
+                        );
+
+                        match decision {
+                            PolicyDecision::Block { reason, .. }
+                            | PolicyDecision::StopRequired { reason, .. } => {
+                                warn!(
+                                    "CANCELACIÓN DE STREAM: Modelo '{}' entró en horario peak durante streaming activo. Cancelando conexión.",
+                                    model
+                                );
+                                if let Some(ref tx) = event_sender {
+                                    let _ = tx.send(format!(
+                                        "{{\"type\":\"stream_cancelled\",\"model\":\"{}\",\"reason\":\"{}\"}}",
+                                        model, reason
+                                    ));
+                                }
+                                let err_chunk = format!(
+                                    "data: {{\"error\":{{\"code\":\"peakguard_stream_cancelled_peak\",\"message\":\"{}\"}}}}\n\n",
+                                    reason
+                                );
+                                yield Ok::<_, std::io::Error>(Bytes::from(err_chunk));
+                                break;
+                            }
+                            PolicyDecision::NotifyOnly { .. } | PolicyDecision::Allow => {
+                                match item {
+                                    Ok(b) => yield Ok(b),
+                                    Err(e) => {
+                                        yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
                 let mut response = axum::response::Response::builder()
                     .status(status)
                     .header("content-type", "text/event-stream")
                     .header("cache-control", "no-cache")
                     .header("connection", "keep-alive")
-                    .body(axum::body::Body::from_stream(stream_bytes))
+                    .body(axum::body::Body::from_stream(wrapped_stream))
                     .unwrap();
 
                 for (k, v) in resp_headers {

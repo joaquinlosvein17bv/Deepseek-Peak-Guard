@@ -384,14 +384,19 @@ impl McpServer {
         let model_entries: Vec<Value> = models
             .iter()
             .map(|m| {
-                let is_direct_deepseek = m.provider_id == "deepseek_direct";
+                let cov = self.registry.classify_coverage(&m.id, true);
                 json!({
                     "id": m.id,
                     "name": m.name,
                     "aliases": m.aliases,
                     "provider_id": m.provider_id,
-                    "coverage_when_proxied": if is_direct_deepseek { "Protected" } else { "Partial" },
-                    "policy_action": if is_direct_deepseek { "403 o abort según modo en peak" } else { "Sujeto a disponibilidad del upstream" }
+                    "coverage_when_proxied": cov.as_str(),
+                    "policy_action": match cov {
+                        crate::registry::CoverageStatus::Protected => "403 o abort según modo en peak",
+                        crate::registry::CoverageStatus::Unverified => "Ruta de gateway no verificada; requiere custom baseURL",
+                        crate::registry::CoverageStatus::Partial => "Sujeto a disponibilidad del upstream",
+                        crate::registry::CoverageStatus::Uncovered => "Ignorado (sin bloqueo)",
+                    }
                 })
             })
             .collect();

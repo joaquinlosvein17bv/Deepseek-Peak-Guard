@@ -1,4 +1,5 @@
 // PeakGuard Adapter para OpenCode (v1.18.35+)
+// Compatible con interfaces V1 y V2 (server, setup, tui)
 // Ubicación recomendada: ~/.config/opencode/plugins/peakguard-opencode.js
 
 import http from "node:http";
@@ -9,7 +10,7 @@ const SOURCE = "peakguard:opencode";
 let activeSessions = new Map(); // sessionID -> { model, lastActive }
 
 /**
- * Consulta el estado actual de PeakGuard
+ * Consulta el estado actual de PeakGuard desde el Control API local
  */
 export async function getPeakGuardStatus() {
   return new Promise((resolve) => {
@@ -31,11 +32,14 @@ export async function getPeakGuardStatus() {
 
 /**
  * Envía acuse de recibo de Stop hacia el daemon PeakGuard
+ * Diferencia explícitamente éxitos de fallos (sin falsos positivos)
  */
-export async function sendStopAck(sessionID, transitionUtc) {
+export async function sendStopAck(sessionID, transitionUtc, success, error) {
   const payload = JSON.stringify({
     session_id: sessionID,
     transition_utc: transitionUtc || new Date().toISOString(),
+    success: Boolean(success),
+    error: error || null,
   });
 
   return new Promise((resolve) => {
@@ -60,7 +64,7 @@ export async function sendStopAck(sessionID, transitionUtc) {
  * Conecta al stream de eventos SSE de PeakGuard para recibir órdenes de Stop nativo
  */
 function startEventSubscriber(client) {
-  const req = http.get(`${PEAKGUARD_CONTROL_URL}/api/v1/events`, (res) => {
+  let sseReq = http.get(`${PEAKGUARD_CONTROL_URL}/api/v1/events`, (res) => {
     let buffer = "";
     res.on("data", async (chunk) => {
       buffer += chunk.toString();
@@ -74,67 +78,111 @@ function startEventSubscriber(client) {
             if (event.type === "stop_requested" && event.session_id) {
               const sessionID = event.session_id;
               console.warn(
-                `[PeakGuard] Recibida orden de Stop para sesión '${sessionID}'. Cancelando turno activo...`
+                `[PeakGuard:OpenCode] Recibida orden de Stop para sesión '${sessionID}'. Cancelando turno activo...`
               );
+
+              let abortSuccess = false;
+              let abortError = null;
 
               // Cancelación mediante API nativa de OpenCode (sin cerrar app ni proceso)
               if (client?.session?.abort) {
                 try {
                   await client.session.abort({ path: { id: sessionID } });
-                  console.info(`[PeakGuard] Turno abortado exitosamente con session.abort({ id: '${sessionID}' }).`);
+                  abortSuccess = true;
+                  console.info(
+                    `[PeakGuard:OpenCode] Turno abortado exitosamente con session.abort({ id: '${sessionID}' }).`
+                  );
                 } catch (err) {
-                  console.error(`[PeakGuard] Error invocando session.abort:`, err);
+                  abortSuccess = false;
+                  abortError = err?.message || String(err);
+                  console.error(`[PeakGuard:OpenCode] Error invocando session.abort:`, err);
                 }
+              } else {
+                abortSuccess = false;
+                abortError = "client.session.abort no está disponible en este contexto";
+                console.error(`[PeakGuard:OpenCode] ${abortError}`);
               }
 
-              // Enviar acuse de recibo al daemon
-              await sendStopAck(sessionID, event.transition_utc);
+              // Enviar acuse de recibo con el estado REAL (sin falsos éxitos)
+              await sendStopAck(sessionID, event.transition_utc, abortSuccess, abortError);
             }
           } catch {
-            // Evento no JSON o heartbeat
+            // Ignorar líneas no JSON o heartbeat
           }
         }
       }
     });
+
+    res.on("end", () => {
+      setTimeout(() => startEventSubscriber(client), 3000);
+    });
   });
 
-  req.on("error", () => {
-    // Reintento silencioso en 5 segundos si el daemon no está activo
+  sseReq.on("error", () => {
     setTimeout(() => startEventSubscriber(client), 5000);
   });
 }
 
-export const PeakGuardServerPlugin = async ({ client }) => {
+/**
+ * Hook de servidor (V1/V2 server plugin)
+ */
+export const PeakGuardServerPlugin = async (input) => {
+  const client = input?.client;
   startEventSubscriber(client);
 
   return {
     event: async ({ event }) => {
       const type = event?.type;
       const properties = event?.properties ?? {};
-      const sessionID = properties.sessionID;
+      const sessionID = properties?.sessionID || properties?.info?.id;
 
-      if (!sessionID) return;
+      if (type === "session.created" && sessionID) {
+        activeSessions.set(sessionID, {
+          model: properties?.info?.model || "unknown",
+          lastActive: Date.now(),
+        });
+      }
 
-      switch (type) {
-        case "session.created":
-        case "session.updated":
-          activeSessions.set(sessionID, {
-            model: properties.model || "unknown",
-            lastActive: Date.now(),
-          });
-          break;
-        case "session.deleted":
-          activeSessions.delete(sessionID);
-          break;
-        default:
-          break;
+      if (type === "session.deleted" && sessionID) {
+        activeSessions.delete(sessionID);
       }
     },
   };
 };
 
+/**
+ * Hook de setup para V1
+ */
+export function PeakGuardSetupPlugin(api) {
+  startEventSubscriber(api?.client);
+}
+
+/**
+ * Hook de TUI para V2
+ */
+export async function PeakGuardTuiPlugin(api) {
+  // Registra slot de status si la API de slots está disponible
+  if (api?.slots?.register) {
+    try {
+      api.slots.register({
+        id: "peakguard-statusline",
+        order: 90,
+        slots: {
+          status_extra() {
+            return "[PeakGuard]";
+          },
+        },
+      });
+    } catch {
+      // Ignorar si el slot no está disponible en esta versión de TUI
+    }
+  }
+}
+
+// Exportación unificada compatible con OpenCode 1.18.35
 export default {
   id: "peakguard.opencode",
   server: PeakGuardServerPlugin,
-  setup() {},
+  setup: PeakGuardSetupPlugin,
+  tui: PeakGuardTuiPlugin,
 };

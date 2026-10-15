@@ -4,7 +4,19 @@ use std::collections::HashMap;
 pub enum CoverageStatus {
     Protected,
     Partial,
+    Unverified,
     Uncovered,
+}
+
+impl CoverageStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Protected => "PROTECTED",
+            Self::Partial => "PARTIAL",
+            Self::Unverified => "UNVERIFIED",
+            Self::Uncovered => "UNCOVERED",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +136,7 @@ impl ModelRegistry {
 
         match self.get_provider_for_model(model_name) {
             Some(provider) if provider.enabled => CoverageStatus::Protected,
+            Some(provider) if provider.id == "opencode_go" => CoverageStatus::Unverified,
             Some(_) => CoverageStatus::Partial,
             None => CoverageStatus::Uncovered,
         }

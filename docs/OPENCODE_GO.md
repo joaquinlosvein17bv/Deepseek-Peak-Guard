@@ -2,7 +2,7 @@
 
 **Fecha de evaluación:** 14 de octubre de 2026  
 **Versión de OpenCode:** 1.18.35  
-**Estado de Cobertura Oficial:** `PARTIAL` (Stop Nativo Verificado; Gateway condicionado a Custom Provider)
+**Estado de Cobertura Oficial:** `UNVERIFIED` por defecto (Inferencia nativa gestionada internamente por OpenCode; elevable a `PROTECTED` configurando Custom Provider con Gateway local)
 
 ---
 
@@ -57,4 +57,4 @@ OpenCode Go opera como un servicio gestionado por el equipo de OpenCode:
 ---
 
 ## 4. Conclusión y Recomendación
-PeakGuard clasifica a OpenCode Go como `PARTIAL` por defecto en la UI para garantizar la transparencia exigida en el Principio P3. Para obtener protección total `PROTEGIDO`, se documenta en el README la configuración del custom provider en `opencode.json`.
+PeakGuard clasifica a OpenCode Go como `UNVERIFIED` por defecto en el comando `doctor` y en el registro para garantizar la máxima honestidad técnica: la inferencia interna de OpenCode no pasa por el loopback salvo que el usuario declare explícitamente el custom provider en `opencode.json`. Para obtener protección perimetral total (`PROTECTED`), se recomienda configurar el custom provider con `baseURL: "http://127.0.0.1:8765/v1"`. Si se utiliza el proveedor integrado junto con el plugin `peakguard-opencode.js`, la protección opera en modo de parada nativa reactiva (`PARTIAL`).

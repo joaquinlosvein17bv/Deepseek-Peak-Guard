@@ -102,6 +102,7 @@ async fn test_streaming_sse_and_concurrency_20_streams() {
         registry: reg_arc.clone(),
         clock: clock.clone(),
         http_client: reqwest::Client::new(),
+        event_tx: None,
     };
 
     let router = create_gateway_router(gateway_state);

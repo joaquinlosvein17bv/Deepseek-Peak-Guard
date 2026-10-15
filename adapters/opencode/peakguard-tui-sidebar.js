@@ -70,13 +70,15 @@ export const tui = async (api) => {
           const countdown = formatCountdown(currentState.seconds_to_peak);
           const isFinalCountdown =
             currentState.seconds_to_peak != null && currentState.seconds_to_peak <= 10 && currentState.seconds_to_peak > 0;
+          const modeStr = (currentState.mode || "restricted_stop").toUpperCase();
+          const coverageStr = currentState.coverage || "PROTEGIDO";
 
           return {
             title: `PeakGuard [${statusDot}]`,
             lines: [
-              `Modo: ${currentState.mode.toUpperCase()}`,
-              `Cobertura: ${currentState.coverage}`,
-              `Próximo peak: ${currentState.next_peak_utc ? currentState.next_peak_utc.slice(11, 16) + " UTC" : "En curso"}`,
+              `Modo: ${modeStr}`,
+              `Cobertura: ${coverageStr}`,
+              `Próximo peak: ${currentState.next_peak_utc ? currentState.next_peak_utc.slice(11, 16) + " UTC" : (isPeak ? "En curso" : "--:-- UTC")}`,
               isFinalCountdown
                 ? `⚠️ CUENTA ATRÁS: ${currentState.seconds_to_peak}s`
                 : `Cuenta atrás: ${countdown}`,

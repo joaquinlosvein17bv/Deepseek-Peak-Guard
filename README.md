@@ -121,8 +121,10 @@ peakguard mcp --config config\peakguard.example.toml
 
 ## 🧪 Pruebas y Verificación
 
-PeakGuard cuenta con una suite automatizada de **29 pruebas unitarias y de integración**, incluyendo:
+PeakGuard cuenta con una suite automatizada de **33 pruebas unitarias y de integración**, incluyendo:
 - 100% de los casos límite de fixtures JSON (`test-fixtures/schedules/boundary_test_cases.json`).
+- **Prueba E2E del Binario Real (`real_daemon_e2e_tests`):** Levanta el subproceso ejecutable `peakguard run`, valida los puertos TCP reales 8765/8766, verifica consultas de salud, cambio dinámico de modo vía PUT, acuses Stop ACK precisos y apagado ordenado.
+- **Cancelación Activa de Streams SSE (`stream_cancellation_tests`):** Demuestra que el cruce de frontera hacia horario pico corta inmediatamente el flujo en modos de bloqueo y emite un payload de error compatible con OpenAI, impidiendo fugas de tokens, mientras que `notify_only` permite la finalización limpia.
 - Detección de saltos bruscos en el reloj del sistema operativo (suspensión/reanudación de Windows).
 - Pruebas E2E de gateway con servidor HTTP simulado y streaming concurrente (20 streams simultáneos).
 - Validación de idempotencia y ciclos de deduplicación de alertas.

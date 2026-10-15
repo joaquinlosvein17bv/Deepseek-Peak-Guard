@@ -89,6 +89,7 @@ async fn test_gateway_allow_and_block_e2e() {
         registry: reg_arc.clone(),
         clock: clock.clone(),
         http_client: reqwest::Client::new(),
+        event_tx: None,
     };
 
     let router = create_gateway_router(gateway_state);

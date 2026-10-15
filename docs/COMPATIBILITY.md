@@ -22,7 +22,7 @@
 | Proveedor | Endpoint Base Real | Modelos / Aliases Típicos | Horarios Peak (UTC) | Excepción Festivos Chinos | Soporte Routing Gateway |
 |---|---|---|---|---|---|
 | **DeepSeek Direct API** | `https://api.deepseek.com/v1` | `deepseek-chat`, `deepseek-reasoner` | Lun–Vie 01:00–04:00 y 06:00–10:00 UTC | ✅ Sí (oficial en pricing) | `VERIFIED` |
-| **OpenCode Go** | `https://opencode.ai/zen/go/v1` | `opencode-go/deepseek-v4-flash`, `deepseek-v4.1-flash` | Lun–Vie 01:00–04:00 y 06:00–10:00 UTC | ❌ No especificada (tratar como NO) | `PARTIAL` (Directo vía Hermes/Pi y custom provider OpenCode) |
+| **OpenCode Go** | `https://opencode.ai/zen/go/v1` | `opencode-go/deepseek-v4-flash`, `deepseek-v4.1-flash` | Lun–Vie 01:00–04:00 y 06:00–10:00 UTC | ❌ No especificada (tratar como NO) | `UNVERIFIED` (Inferencia nativa gestionada; requiere custom provider con baseURL local para ser `PROTECTED`) |
 | **TokenHarbor / Resellers** | `https://tokenharbor.ai/v1` | `deepseek-v4.1-flash` | Dependiente del reseller (no inferir) | ❌ No especificada | `UNVERIFIED` (perfil propio requerido) |
 
 ---
@@ -52,6 +52,7 @@
 
 ## 4. Clasificación de Cobertura según la Especificación
 
-- **PROTEGIDO (`VERIFIED`)**: Tráfico configurado explícitamente para pasar por el Gateway `http://127.0.0.1:8765` y/o con adaptador nativo activo verificado.
+- **PROTEGIDO (`PROTECTED` / `VERIFIED`)**: Tráfico configurado explícitamente para pasar por el Gateway `http://127.0.0.1:8765` y/o con adaptador nativo activo y verificado en tests.
 - **PARCIAL (`PARTIAL`)**: Clientes donde el control nativo o el enrutamiento está sujeto a limitaciones (ej. Hermes con `/stop` amplio).
+- **NO VERIFICADO (`UNVERIFIED`)**: Proveedores o configuraciones donde el cliente gestiona la inferencia internamente o no se ha verificado el enrutamiento a través del Gateway local (ej. OpenCode Go por defecto sin custom provider configurado).
 - **NO CUBIERTO (`UNCOVERED`)**: Procesos o herramientas que apunten directamente a internet sin pasar por el loopback o sin plugin de control reportado.

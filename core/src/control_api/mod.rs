@@ -1,3 +1,4 @@
+use crate::clock::Clock;
 use crate::policy::{OperatingMode, PolicyEngine, StopKey};
 use crate::registry::ModelRegistry;
 use crate::schedule::Schedule;
@@ -8,14 +9,13 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use chrono::Utc;
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct ControlApiState {
@@ -23,6 +23,7 @@ pub struct ControlApiState {
     pub registry: Arc<ModelRegistry>,
     pub schedules: Arc<HashMap<String, Schedule>>,
     pub event_tx: broadcast::Sender<String>,
+    pub clock: Arc<dyn Clock>,
 }
 
 #[derive(Serialize)]
@@ -41,6 +42,13 @@ pub struct StopAckRequest {
     pub session_id: String,
     pub turn_id: Option<String>,
     pub transition_utc: String,
+    #[serde(default = "default_true")]
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -63,7 +71,7 @@ async fn handle_health() -> &'static str {
 }
 
 async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusResponse> {
-    let now = Utc::now();
+    let now = state.clock.now();
     let mode = state.policy_engine.get_mode();
 
     // Consultar horario de deepseek_direct
@@ -86,20 +94,47 @@ async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusRespo
 async fn handle_stop_ack(
     State(state): State<ControlApiState>,
     Json(payload): Json<StopAckRequest>,
-) -> StatusCode {
-    info!(
-        "Stop ACK recibido del adaptador: session_id='{}', turn_id='{:?}'",
-        payload.session_id, payload.turn_id
-    );
-
+) -> (StatusCode, Json<serde_json::Value>) {
     let key = StopKey {
-        session_id: payload.session_id,
-        turn_id: payload.turn_id.unwrap_or_else(|| "default".to_string()),
-        transition_utc: payload.transition_utc,
+        session_id: payload.session_id.clone(),
+        turn_id: payload.turn_id.clone().unwrap_or_else(|| "default".to_string()),
+        transition_utc: payload.transition_utc.clone(),
     };
 
-    state.policy_engine.acknowledge_stop(key);
-    StatusCode::OK
+    if payload.success {
+        info!(
+            "Stop ACK exitoso confirmado por adaptador: session_id='{}', turn_id='{:?}'",
+            payload.session_id, payload.turn_id
+        );
+        state.policy_engine.acknowledge_stop(key);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "acknowledged",
+                "success": true,
+                "session_id": payload.session_id
+            })),
+        )
+    } else {
+        warn!(
+            "Stop ACK con FALLO reportado por adaptador: session_id='{}', error='{:?}'. Stop NO será marcado como exitoso.",
+            payload.session_id, payload.error
+        );
+        let _ = state.event_tx.send(format!(
+            "{{\"type\":\"stop_failed\",\"session_id\":\"{}\",\"error\":\"{}\"}}",
+            payload.session_id,
+            payload.error.unwrap_or_else(|| "Abort failed".to_string())
+        ));
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "failed",
+                "success": false,
+                "session_id": payload.session_id,
+                "fallback": "gateway_cancel"
+            })),
+        )
+    }
 }
 
 async fn handle_set_mode(

@@ -141,7 +141,7 @@ fn test_model_registry_resolution_and_coverage() {
     // 3. OpenCode Go está deshabilitado por defecto para routing directo
     assert_eq!(
         registry.classify_coverage("opencode/deepseek-v4-flash-free", true),
-        CoverageStatus::Partial
+        CoverageStatus::Unverified
     );
 
     // 4. Modelo desconocido

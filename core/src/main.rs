@@ -1,8 +1,12 @@
 pub mod clock;
 mod commands;
 pub mod config;
+pub mod control_api;
+pub mod gateway;
 mod logger;
 pub mod mcp;
+pub mod notifications;
+pub mod policy;
 pub mod registry;
 pub mod schedule;
 

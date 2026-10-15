@@ -54,7 +54,9 @@ pub fn execute<P: AsRef<Path>>(config_path: Option<P>) {
     if let Some(cfg) = cfg_opt {
         for p in &cfg.providers {
             if p.enabled {
-                println!("  - Proveedor '{}' [PROTEGIDO]: upstream={:?}, schedule='{}'", p.id, p.upstream, p.schedule_id);
+                println!("  - Proveedor '{}' [PROTEGIDO / VERIFICADO]: upstream={:?}, schedule='{}'", p.id, p.upstream, p.schedule_id);
+            } else if p.id == "opencode_go" {
+                println!("  - Proveedor '{}' [NO VERIFICADO / UNVERIFIED]: Inferencia gestionada por OpenCode; requiere custom baseURL para pasar por Gateway", p.id);
             } else {
                 println!("  - Proveedor '{}' [DESHABILITADO / NO CUBIERTO]", p.id);
             }
