@@ -130,7 +130,16 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
     };
 
     // 6. Autenticación y Construcción de routers de Axum
-    let auth_token = Arc::new(control_api::resolve_or_create_control_token(&cfg.control.token_env));
+    let auth_token = match control_api::resolve_or_create_control_token(&cfg.control.token_env) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            error!(
+                "Error crítico: Fallo al generar o asegurar credenciales de Control API: {}",
+                e
+            );
+            return Err(e);
+        }
+    };
     info!(
         "Control API inicializada con autenticación Bearer Token (token_env='{}')",
         cfg.control.token_env
@@ -193,8 +202,8 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
             }
             let now = ticker_clock.now();
 
-            // Purgar sesiones inactivas (más de 60s sin heartbeat)
-            ticker_session_reg.prune_stale(chrono::Duration::seconds(60));
+            // Purgar sesiones inactivas (más de 60s sin heartbeat), preservando turnos activos hasta 30m
+            ticker_session_reg.prune_stale(chrono::Duration::seconds(60), chrono::Duration::minutes(30));
 
             for (sched_id, schedule) in &ticker_schedules {
                 let is_peak = schedule.is_peak(now);

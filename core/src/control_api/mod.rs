@@ -3,7 +3,7 @@ use crate::policy::{OperatingMode, PolicyEngine, StopKey};
 use crate::registry::{ActiveSession, ModelRegistry, SessionRegistry};
 use crate::schedule::Schedule;
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::stream::Stream;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -42,6 +43,8 @@ pub struct StatusResponse {
     pub next_off_peak_utc: Option<String>,
     pub coverage: String,
     pub active_sessions_count: usize,
+    pub observed_traffic_count: usize,
+    pub coverage_details: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -88,31 +91,26 @@ pub fn create_control_router(state: ControlApiState) -> Router {
         .with_state(state)
 }
 
-fn check_auth(
-    state: &ControlApiState,
-    headers: &HeaderMap,
-    query: Option<&HashMap<String, String>>,
-) -> bool {
-    let expected = state.auth_token.as_str();
+/// Validación estricta de autenticación Bearer Token (P0).
+/// - Nunca acepta un token esperado vacío (falla cerrado).
+/// - Exige cabecera 'Authorization: Bearer <token>'.
+/// - Elimina explícitamente tokens en parámetros query por seguridad.
+fn check_auth(state: &ControlApiState, headers: &HeaderMap) -> bool {
+    let expected = state.auth_token.as_str().trim();
     if expected.is_empty() {
-        return true;
+        warn!("Seguridad: auth_token configurado está vacío. Petición rechazada por fail-closed.");
+        return false;
     }
-    // 1. Cabecera Authorization: Bearer <token>
+
     if let Some(auth) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
         if let Some(token) = auth.strip_prefix("Bearer ") {
-            if token.trim() == expected {
+            let token = token.trim();
+            if !token.is_empty() && token == expected {
                 return true;
             }
         }
     }
-    // 2. Parámetro query ?token=... (útil para EventSource de SSE)
-    if let Some(q) = query {
-        if let Some(token) = q.get("token") {
-            if token.trim() == expected {
-                return true;
-            }
-        }
-    }
+
     false
 }
 
@@ -120,6 +118,8 @@ async fn handle_health() -> &'static str {
     "OK"
 }
 
+/// Evaluación de cobertura dinámica y honesta (Paso 3).
+/// No asume protección basándose únicamente en la configuración declarada.
 async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusResponse> {
     let now = state.clock.now();
     let mode = state.policy_engine.get_mode();
@@ -130,33 +130,79 @@ async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusRespo
     let next_peak = schedule.and_then(|s| s.next_peak(now));
     let next_off = schedule.and_then(|s| s.next_off_peak(now));
 
-    // Determinar cobertura dinámica honesta (nunca hardcoded)
-    let coverage = {
+    let traffic = state.registry.get_traffic_tracker();
+    let total_observed = traffic.get_total_observed();
+    let active_sessions = state.session_registry.count_active();
+
+    // Determinar cobertura dinámica honesta (nunca estática)
+    let (coverage, coverage_details) = {
         let providers = state.registry.get_providers();
         let any_enabled = providers.values().any(|p| p.enabled);
-        if !any_enabled {
-            "UNCOVERED".to_string()
-        } else {
-            let direct_enabled = providers
-                .get("deepseek_direct")
-                .map(|p| p.enabled)
-                .unwrap_or(false);
-            let go_enabled = providers
-                .get("opencode_go")
-                .map(|p| p.enabled)
-                .unwrap_or(false);
 
-            if direct_enabled {
-                "PROTECTED".to_string()
-            } else if go_enabled {
-                "UNVERIFIED".to_string()
+        if !any_enabled {
+            (
+                "UNCOVERED".to_string(),
+                serde_json::json!({
+                    "reason": "no_providers_enabled",
+                    "observed_requests": total_observed,
+                    "gateway_operational": true,
+                }),
+            )
+        } else {
+            let direct_provider = providers.get("deepseek_direct");
+            let direct_enabled = direct_provider.map(|p| p.enabled).unwrap_or(false);
+            let go_provider = providers.get("opencode_go");
+            let go_enabled = go_provider.map(|p| p.enabled).unwrap_or(false);
+
+            let direct_traffic_observed = traffic.has_observed_provider("deepseek_direct");
+
+            // OpenCode Go gestiona inferencia nativamente y no pasa por el gateway por defecto
+            if go_enabled && !direct_enabled {
+                (
+                    "UNVERIFIED".to_string(),
+                    serde_json::json!({
+                        "reason": "opencode_go_managed_inference_unverified",
+                        "observed_requests": total_observed,
+                        "requires_custom_base_url": true,
+                        "gateway_operational": true,
+                    }),
+                )
+            } else if direct_enabled {
+                // Solo declarar PROTECTED si el gateway ha intermediado tráfico real o hay sesión activa conectada
+                if direct_traffic_observed || active_sessions > 0 {
+                    (
+                        "PROTECTED".to_string(),
+                        serde_json::json!({
+                            "verified_route": "deepseek_direct",
+                            "observed_requests": total_observed,
+                            "active_sessions": active_sessions,
+                            "gateway_operational": true,
+                        }),
+                    )
+                } else {
+                    (
+                        "PARTIAL".to_string(),
+                        serde_json::json!({
+                            "reason": "route_configured_awaiting_first_observed_request",
+                            "configured_route": "deepseek_direct",
+                            "observed_requests": 0,
+                            "active_sessions": 0,
+                            "gateway_operational": true,
+                        }),
+                    )
+                }
             } else {
-                "PARTIAL".to_string()
+                (
+                    "PARTIAL".to_string(),
+                    serde_json::json!({
+                        "reason": "provider_enabled_without_verified_route",
+                        "observed_requests": total_observed,
+                        "gateway_operational": true,
+                    }),
+                )
             }
         }
     };
-
-    let active_sessions_count = state.session_registry.count_active();
 
     Json(StatusResponse {
         current_time_utc: now.to_rfc3339(),
@@ -166,7 +212,9 @@ async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusRespo
         seconds_to_peak: next_peak.map(|(_, s)| s),
         next_off_peak_utc: next_off.map(|(dt, _)| dt.to_rfc3339()),
         coverage,
-        active_sessions_count,
+        active_sessions_count: active_sessions,
+        observed_traffic_count: total_observed,
+        coverage_details,
     })
 }
 
@@ -175,7 +223,7 @@ async fn handle_stop_ack(
     headers: HeaderMap,
     Json(payload): Json<StopAckRequest>,
 ) -> Response {
-    if !check_auth(&state, &headers, None) {
+    if !check_auth(&state, &headers) {
         warn!("Intento no autorizado de enviar Stop ACK (Bearer Token ausente o incorrecto).");
         return (
             StatusCode::UNAUTHORIZED,
@@ -233,7 +281,7 @@ async fn handle_set_mode(
     headers: HeaderMap,
     Json(payload): Json<SetModeRequest>,
 ) -> Response {
-    if !check_auth(&state, &headers, None) {
+    if !check_auth(&state, &headers) {
         warn!("Intento no autorizado de cambiar modo de protección (Bearer Token ausente o incorrecto).");
         return (
             StatusCode::UNAUTHORIZED,
@@ -259,7 +307,7 @@ async fn handle_session_register(
     headers: HeaderMap,
     Json(payload): Json<ActiveSession>,
 ) -> Response {
-    if !check_auth(&state, &headers, None) {
+    if !check_auth(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
     info!(
@@ -279,7 +327,7 @@ async fn handle_session_heartbeat(
     headers: HeaderMap,
     Json(payload): Json<SessionHeartbeatRequest>,
 ) -> Response {
-    if !check_auth(&state, &headers, None) {
+    if !check_auth(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
     let updated = state.session_registry.heartbeat(
@@ -307,7 +355,7 @@ async fn handle_session_unregister(
     headers: HeaderMap,
     Json(payload): Json<SessionUnregisterRequest>,
 ) -> Response {
-    if !check_auth(&state, &headers, None) {
+    if !check_auth(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
     state.session_registry.unregister(&payload.session_id);
@@ -322,7 +370,7 @@ async fn handle_shutdown(
     State(state): State<ControlApiState>,
     headers: HeaderMap,
 ) -> Response {
-    if !check_auth(&state, &headers, None) {
+    if !check_auth(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
     info!("Petición autorizada de apagado ordenada recibida vía Control API.");
@@ -332,13 +380,14 @@ async fn handle_shutdown(
     (StatusCode::OK, Json(serde_json::json!({ "status": "shutting_down" }))).into_response()
 }
 
+/// Suscripción a eventos SSE mediante transporte HTTP autenticado con cabeceras (P0).
+/// No admite parámetros query de token en URL para evitar filtraciones en logs y proxies.
 async fn handle_events(
     State(state): State<ControlApiState>,
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    if !check_auth(&state, &headers, Some(&query)) {
-        warn!("Intento no autorizado de suscribirse a SSE en Control API.");
+    if !check_auth(&state, &headers) {
+        warn!("Intento no autorizado de suscribirse a SSE en Control API (Bearer Token ausente o incorrecto).");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -351,14 +400,27 @@ async fn handle_events(
     Ok(Sse::new(stream))
 }
 
-pub fn resolve_or_create_control_token(token_env_var: &str) -> String {
+/// Genera un token criptográficamente seguro utilizando el CSPRNG del sistema operativo (P0).
+pub fn generate_secure_token() -> Result<String, Box<dyn std::error::Error>> {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes)
+        .map_err(|e| format!("Fallo en CSPRNG del sistema operativo: {}", e))?;
+    let hex_str: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    Ok(format!("pg_{}", hex_str))
+}
+
+/// Carga el token existente desde variable de entorno o archivo, o genera uno nuevo
+/// de forma atómica con permisos restringidos.
+/// Si falla la generación o guardado, retorna Err para fallar cerrado (P0).
+pub fn resolve_or_create_control_token(token_env_var: &str) -> Result<String, Box<dyn std::error::Error>> {
     if let Ok(val) = std::env::var(token_env_var) {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
-    // Revisar o crear archivo ~/.peakguard/control.token
+
     let token_dir = match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         Ok(home) => std::path::PathBuf::from(home).join(".peakguard"),
         Err(_) => std::path::PathBuf::from(".peakguard"),
@@ -367,17 +429,29 @@ pub fn resolve_or_create_control_token(token_env_var: &str) -> String {
     if let Ok(content) = std::fs::read_to_string(&token_file) {
         let trimmed = content.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    let token = format!("pg_{:x}{:x}{:08x}", pid, now, (now ^ 0x5a5a5a5a) as u32);
-    let _ = std::fs::create_dir_all(&token_dir);
-    let _ = std::fs::write(&token_file, &token);
-    token
+    let token = generate_secure_token()?;
+    std::fs::create_dir_all(&token_dir)?;
+
+    // Escritura atómica para evitar condiciones de carrera y escrituras parciales
+    let tmp_file = token_dir.join(format!("control.token.tmp.{}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_file)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = f.metadata()?.permissions();
+            perms.set_mode(0o600);
+            f.set_permissions(perms)?;
+        }
+        f.write_all(token.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_file, &token_file)?;
+
+    Ok(token)
 }

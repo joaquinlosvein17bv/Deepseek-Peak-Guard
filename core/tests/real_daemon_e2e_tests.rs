@@ -152,7 +152,8 @@ exclude_chinese_public_holidays = true
     assert_eq!(status_resp.status(), reqwest::StatusCode::OK);
     let status_json: serde_json::Value = status_resp.json().await.unwrap();
     assert_eq!(status_json["mode"], "restricted_stop");
-    assert_eq!(status_json["coverage"], "PROTECTED");
+    // T18 Paso 3: Cobertura honesta. Antes de tráfico observado o sesión activa, es PARTIAL
+    assert_eq!(status_json["coverage"], "PARTIAL");
 
     // 3. T17.1: Verificar que peticiones administrativas sin autenticación SON RECHAZADAS (401 Unauthorized)
     let unauth_mode = client
@@ -281,6 +282,15 @@ exclude_chinese_public_holidays = true
 
     assert_eq!(comp_resp.status(), reqwest::StatusCode::OK);
     assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+
+    // T18: Tras tráfico observado por el gateway, la cobertura se actualiza a PROTECTED
+    let status_after_resp = client
+        .get(format!("http://127.0.0.1:{}/api/v1/status", ctrl_port))
+        .send()
+        .await
+        .unwrap();
+    let status_after_json: serde_json::Value = status_after_resp.json().await.unwrap();
+    assert_eq!(status_after_json["coverage"], "PROTECTED");
 
     // 8. T17.8: Apagado ordenado limpio mediante Control API (sin child.kill())
     let shutdown_resp = client

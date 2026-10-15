@@ -872,6 +872,7 @@ dependencies = [
  "clap",
  "futures-util",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "thiserror",

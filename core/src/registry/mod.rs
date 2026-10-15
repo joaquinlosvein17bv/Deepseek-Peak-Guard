@@ -35,10 +35,47 @@ pub struct ProviderInfo {
     pub enabled: bool,
 }
 
+#[derive(Debug, Default)]
+pub struct TrafficTracker {
+    total_observed_requests: std::sync::atomic::AtomicUsize,
+    observed_by_provider: RwLock<HashMap<String, usize>>,
+    observed_by_model: RwLock<HashMap<String, usize>>,
+}
+
+impl TrafficTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_request(&self, provider_id: &str, model_id: &str) {
+        self.total_observed_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut p_map = self.observed_by_provider.write().unwrap();
+        *p_map.entry(provider_id.to_string()).or_insert(0) += 1;
+
+        let mut m_map = self.observed_by_model.write().unwrap();
+        *m_map.entry(model_id.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn get_total_observed(&self) -> usize {
+        self.total_observed_requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn has_observed_provider(&self, provider_id: &str) -> bool {
+        let p_map = self.observed_by_provider.read().unwrap();
+        p_map.get(provider_id).map(|&c| c > 0).unwrap_or(false)
+    }
+
+    pub fn get_observed_providers(&self) -> Vec<String> {
+        let p_map = self.observed_by_provider.read().unwrap();
+        p_map.keys().cloned().collect()
+    }
+}
+
 pub struct ModelRegistry {
     providers: HashMap<String, ProviderInfo>,
     models: HashMap<String, ModelInfo>,
     alias_to_model: HashMap<String, String>,
+    traffic_tracker: std::sync::Arc<TrafficTracker>,
 }
 
 impl Default for ModelRegistry {
@@ -47,6 +84,7 @@ impl Default for ModelRegistry {
             providers: HashMap::new(),
             models: HashMap::new(),
             alias_to_model: HashMap::new(),
+            traffic_tracker: std::sync::Arc::new(TrafficTracker::new()),
         };
 
         // Proveedor por defecto 1: DeepSeek Direct API
@@ -158,6 +196,16 @@ impl ModelRegistry {
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }
+
+    /// Registra tráfico observado para un proveedor y modelo
+    pub fn record_observed_traffic(&self, provider_id: &str, model_id: &str) {
+        self.traffic_tracker.record_request(provider_id, model_id);
+    }
+
+    /// Retorna referencia al tracker de tráfico observado
+    pub fn get_traffic_tracker(&self) -> std::sync::Arc<TrafficTracker> {
+        self.traffic_tracker.clone()
+    }
 }
 
 use chrono::{DateTime, Utc};
@@ -245,10 +293,19 @@ impl SessionRegistry {
         map.values().filter(|s| s.is_active).count()
     }
 
-    pub fn prune_stale(&self, timeout: chrono::Duration) {
-        let cutoff = Utc::now() - timeout;
+    pub fn prune_stale(&self, inactive_timeout: chrono::Duration, active_max_silence: chrono::Duration) {
+        let now = Utc::now();
         let mut map = self.sessions.write().unwrap();
-        map.retain(|_, s| s.last_heartbeat >= cutoff);
+        map.retain(|_, s| {
+            let elapsed = now - s.last_heartbeat;
+            if s.is_active {
+                // Durante turnos activos de razonamiento, permitir hasta active_max_silence (ej. 30 min)
+                elapsed < active_max_silence
+            } else {
+                // Sesiones inactivas o finalizadas: podar tras inactive_timeout (ej. 60s)
+                elapsed < inactive_timeout
+            }
+        });
     }
 }
 
@@ -333,19 +390,40 @@ mod tests {
         let registry = SessionRegistry::new();
         let old_time = Utc::now() - chrono::Duration::seconds(100);
 
+        // Sesión activa (razonamiento largo)
         registry.register(ActiveSession {
-            session_id: "stale-session".to_string(),
+            session_id: "active-reasoning-session".to_string(),
             client_type: "pi".to_string(),
-            turn_id: None,
+            turn_id: Some("turn-r1".to_string()),
             provider_id: "deepseek_direct".to_string(),
-            model: "deepseek-chat".to_string(),
+            model: "deepseek-reasoner".to_string(),
             schedule_id: None,
             is_active: true,
             last_heartbeat: old_time,
         });
 
-        // Al podar sesiones más viejas de 30s
-        registry.prune_stale(chrono::Duration::seconds(30));
+        // Sesión inactiva (finalizada)
+        registry.register(ActiveSession {
+            session_id: "inactive-stale-session".to_string(),
+            client_type: "opencode".to_string(),
+            turn_id: None,
+            provider_id: "deepseek_direct".to_string(),
+            model: "deepseek-chat".to_string(),
+            schedule_id: None,
+            is_active: false,
+            last_heartbeat: old_time,
+        });
+
+        assert_eq!(registry.count_active(), 1);
+
+        // Podar con inactive_timeout = 30s y active_max_silence = 30 min
+        registry.prune_stale(chrono::Duration::seconds(30), chrono::Duration::minutes(30));
+
+        // La sesión activa DEBE preservarse durante el razonamiento silencioso
+        assert_eq!(registry.count_active(), 1);
+
+        // Si la sesión activa supera el límite máximo de silencio (ej. 30 min), recién entonces se poda
+        registry.prune_stale(chrono::Duration::seconds(30), chrono::Duration::seconds(50));
         assert_eq!(registry.count_active(), 0);
     }
 }

@@ -190,6 +190,9 @@ async fn handle_chat_completions(
     let upstream_base = &provider.upstream_url;
     let target_url = format!("{}/chat/completions", upstream_base.trim_end_matches('/'));
 
+    // Registrar tráfico observado en el Data Plane del Gateway para cobertura verificable
+    state.registry.record_observed_traffic(&provider.id, &model_name);
+
     // 4. Preparar petición hacia el upstream (propagando headers y Authorization)
     let mut req = state.http_client.post(&target_url).body(body.clone());
 
