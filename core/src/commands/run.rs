@@ -72,7 +72,7 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
 
     // 4. Canal de eventos SSE y registro central de sesiones
     let (event_tx, _) = broadcast::channel::<String>(256);
-    let session_registry = Arc::new(SessionRegistry::new_with_persistence());
+    let session_registry = Arc::new(SessionRegistry::new_with_persistence().map_err(|e| -> Box<dyn std::error::Error> { e })?);
 
     // Soporte para reloj simulado determinista en pruebas E2E (vía PEAKGUARD_SIMULATED_TIME)
     let (clock, test_clock_opt): (Arc<dyn Clock>, Option<TestClock>) =
@@ -234,7 +234,7 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
                                 "EMITIENDO STOP NATIVO: Sesión activa '{}' (instancia '{}', cliente '{}', modelo '{}') detenida por inicio de horario peak.",
                                 sess.session_id, sess.client_instance_id, sess.client_type, sess.model
                             );
-                            let cmd = ticker_session_reg.get_command_manager().create_command(
+                            let cmd_res = ticker_session_reg.get_command_manager().create_command(
                                 &sess.client_type,
                                 &sess.client_instance_id,
                                 &sess.session_id,
@@ -245,18 +245,25 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
                                 "Horario peak iniciado. Cancelando turno activo mediante Stop nativo sin cerrar aplicación.",
                             );
 
-                            let _ = ticker_event_tx.send(format!(
-                                "{{\"type\":\"stop_requested\",\"command_id\":\"{}\",\"client_type\":\"{}\",\"client_instance_id\":\"{}\",\"session_id\":\"{}\",\"turn_id\":{},\"provider_id\":\"{}\",\"model\":\"{}\",\"transition_utc\":\"{}\",\"reason\":\"{}\"}}",
-                                cmd.command_id,
-                                cmd.client_type,
-                                cmd.client_instance_id,
-                                cmd.session_id,
-                                cmd.turn_id.as_ref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
-                                cmd.provider_id,
-                                cmd.model,
-                                cmd.transition_utc,
-                                cmd.reason
-                            ));
+                            match cmd_res {
+                                Ok(cmd) => {
+                                    let _ = ticker_event_tx.send(format!(
+                                        "{{\"type\":\"stop_requested\",\"command_id\":\"{}\",\"client_type\":\"{}\",\"client_instance_id\":\"{}\",\"session_id\":\"{}\",\"turn_id\":{},\"provider_id\":\"{}\",\"model\":\"{}\",\"transition_utc\":\"{}\",\"reason\":\"{}\"}}",
+                                        cmd.command_id,
+                                        cmd.client_type,
+                                        cmd.client_instance_id,
+                                        cmd.session_id,
+                                        cmd.turn_id.as_ref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
+                                        cmd.provider_id,
+                                        cmd.model,
+                                        cmd.transition_utc,
+                                        cmd.reason
+                                    ));
+                                }
+                                Err(e) => {
+                                    error!("Error creando/persistiendo comando de stop para sesión '{}': {}. El gateway mantendrá la política de bloqueo.", sess.session_id, e);
+                                }
+                            }
                         }
                     }
 

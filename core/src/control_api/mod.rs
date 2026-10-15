@@ -265,6 +265,21 @@ async fn handle_stop_ack(
             .into_response();
     }
 
+    let command_id = match payload.command_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            warn!("Stop ACK rechazado: 'command_id' es obligatorio y no fue provisto.");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "missing_command_id",
+                    "message": "El campo 'command_id' es obligatorio en StopAckRequest"
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let client_instance_id = match payload.client_instance_id.as_deref() {
         Some(id) if !id.trim().is_empty() => id.trim(),
         _ => {
@@ -282,8 +297,8 @@ async fn handle_stop_ack(
 
     let cmd_mgr = state.session_registry.get_command_manager();
     let ack_res = cmd_mgr.record_ack(
-        payload.command_id.as_deref(),
-        Some(client_instance_id),
+        command_id,
+        client_instance_id,
         &payload.session_id,
         payload.turn_id.as_deref(),
         payload.success,
@@ -466,8 +481,21 @@ async fn handle_session_heartbeat(
     if !check_auth(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
+    let client_instance_id = match payload.client_instance_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "missing_client_instance_id",
+                    "message": "El campo 'client_instance_id' es obligatorio para heartbeat"
+                })),
+            )
+                .into_response();
+        }
+    };
     let updated = state.session_registry.heartbeat(
-        payload.client_instance_id.as_deref(),
+        client_instance_id,
         &payload.session_id,
         payload.turn_id,
         payload.is_active,
@@ -495,16 +523,37 @@ async fn handle_session_unregister(
     if !check_auth(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "No autorizado").into_response();
     }
+    let client_instance_id = match payload.client_instance_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "missing_client_instance_id",
+                    "message": "El campo 'client_instance_id' es obligatorio para unregister"
+                })),
+            )
+                .into_response();
+        }
+    };
     info!(
-        "Sesión desregistrada en Control API: id='{}', inst='{:?}'",
-        payload.session_id, payload.client_instance_id
+        "Sesión desregistrada en Control API: id='{}', inst='{}'",
+        payload.session_id, client_instance_id
     );
-    state.session_registry.unregister(payload.client_instance_id.as_deref(), &payload.session_id);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "status": "unregistered" })),
-    )
-        .into_response()
+    let unregistered = state.session_registry.unregister(client_instance_id, &payload.session_id);
+    if unregistered {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "unregistered" })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "session_not_found" })),
+        )
+            .into_response()
+    }
 }
 
 async fn handle_shutdown(

@@ -196,7 +196,7 @@ async fn test_repro_pending_commands_and_instance_isolated_ack() {
         "deepseek-chat",
         &Utc::now().to_rfc3339(),
         "Transición a horario pico",
-    );
+    ).unwrap();
 
     // 2. Consultar pendientes para inst_legit_01
     let res_pending = client

@@ -283,36 +283,41 @@ export default function peakguardExtension(pi: any) {
       return;
     }
 
-    // T18.2.2: Validación estricta de turn_id
-    // Si la orden de Stop especifica turn_id y la sesión activa tiene un activeTurnId diferente,
-    // es una orden tardía para un turno previo: NO cancelar el nuevo turno.
-    if (event.turn_id && activeTurnId && event.turn_id !== activeTurnId) {
-      console.warn(
-        `[PeakGuard:Pi] Orden Stop descartada por discordancia de turno: la orden es para '${event.turn_id}', pero el turno actual activo es '${activeTurnId}'.`
-      );
+    const eventTurn = typeof event.turn_id === "string" ? event.turn_id.trim() : null;
+    const currentTurn = typeof activeTurnId === "string" ? activeTurnId.trim() : null;
+
+    // T18.3.1: Exigir coincidencia verificable entre instancia, sesión y turno antes de invocar abort nativo.
+    // Si falta event.turn_id o la identidad actual no puede comprobarse, no ejecutar un abort ambiguo.
+    if (!eventTurn || !currentTurn) {
+      const reason = !eventTurn && !currentTurn
+        ? "unverifiable_turn_identity: turno ausente en la orden y en la sesión"
+        : !eventTurn
+        ? "unverifiable_turn_identity: event.turn_id ausente en la orden de Stop"
+        : "unverifiable_turn_identity: la sesión actual no tiene un turno activo comprobable";
+      console.warn(`[PeakGuard:Pi] ${reason}. Se omite abort ambiguo y se mantiene bloqueo en gateway.`);
       await sendStopAck(
         targetSession,
         event.transition_utc,
         false,
-        "turn_mismatch",
-        event.turn_id,
+        reason,
+        eventTurn || currentTurn,
         event.command_id,
         CLIENT_INSTANCE_ID
       );
       return;
     }
 
-    // Si la sesión no tiene un turno activo o su identidad es inverificable, no ejecutar abort ambiguo
-    if (!activeTurnId) {
+    // T18.2.2 & T18.3.1: Una orden antigua (turn_id anterior) NUNCA debe cancelar un turno nuevo
+    if (eventTurn !== currentTurn) {
       console.warn(
-        `[PeakGuard:Pi] Turno no activo o identidad inverificable en sesión '${targetSession}'. Se omite abort ambiguo y se delega en fallback del gateway.`
+        `[PeakGuard:Pi] Orden Stop descartada por discordancia de turno: orden para '${eventTurn}', pero turno actual activo es '${currentTurn}'.`
       );
       await sendStopAck(
         targetSession,
         event.transition_utc,
         false,
-        "no_active_turn_or_unverifiable",
-        event.turn_id,
+        "turn_mismatch",
+        eventTurn,
         event.command_id,
         CLIENT_INSTANCE_ID
       );
@@ -320,7 +325,7 @@ export default function peakguardExtension(pi: any) {
     }
 
     // Deduplicar órdenes de Stop repetidas por command_id o clave compuesta
-    const stopKey = event.command_id || `${targetSession}:${event.turn_id || ""}:${event.transition_utc || ""}`;
+    const stopKey = event.command_id || `${targetSession}:${eventTurn}:${event.transition_utc || ""}`;
     if (processedStopKeys.has(stopKey)) {
       return;
     }

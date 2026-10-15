@@ -108,6 +108,43 @@ exclude_chinese_public_holidays = true
     let tmp_config_path = std::env::temp_dir().join(format!("peakguard_test_{}.toml", std::process::id()));
     std::fs::write(&tmp_config_path, &tmp_config).expect("No se pudo escribir archivo de prueba temporal");
 
+    let tmp_commands_path = std::env::temp_dir().join(format!("peakguard_test_cmds_{}.json", std::process::id()));
+    let initial_cmds = serde_json::json!([
+        {
+            "command_id": "cmd_test_daemon_01",
+            "client_type": "opencode",
+            "client_instance_id": "inst_daemon_test",
+            "session_id": "test-session-ack-ok",
+            "turn_id": null,
+            "provider_id": "deepseek_direct",
+            "model": "deepseek-chat",
+            "transition_utc": "2026-10-15T01:00:00Z",
+            "reason": "Test ok",
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "status": "Pending",
+            "acked_at": null,
+            "ack_success": null,
+            "ack_error": null
+        },
+        {
+            "command_id": "cmd_test_daemon_02",
+            "client_type": "opencode",
+            "client_instance_id": "inst_daemon_test",
+            "session_id": "test-session-ack-fail",
+            "turn_id": null,
+            "provider_id": "deepseek_direct",
+            "model": "deepseek-chat",
+            "transition_utc": "2026-10-15T01:00:00Z",
+            "reason": "Test fail",
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "status": "Pending",
+            "acked_at": null,
+            "ack_success": null,
+            "ack_error": null
+        }
+    ]);
+    std::fs::write(&tmp_commands_path, serde_json::to_string(&initial_cmds).unwrap()).unwrap();
+
     // Localizar el ejecutable real compilado
     let bin_path = env!("CARGO_BIN_EXE_peakguard");
 
@@ -117,6 +154,7 @@ exclude_chinese_public_holidays = true
         .arg("--config")
         .arg(&tmp_config_path)
         .env("PEAKGUARD_CONTROL_TOKEN", auth_token)
+        .env("PEAKGUARD_COMMANDS_PATH", &tmp_commands_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -129,7 +167,19 @@ exclude_chinese_public_holidays = true
 
     // 1. Esperar que ambos puertos reales (Gateway y Control API) estén listos
     let mut ready = false;
-    for _ in 0..40 {
+    for _i in 0..40 {
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut out = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                use tokio::io::AsyncReadExt;
+                let _ = stdout.read_to_string(&mut out).await;
+            }
+            if let Some(mut stderr) = child.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let _ = stderr.read_to_string(&mut out).await;
+            }
+            panic!("El proceso daemon terminó prematuramente con estado: {:?}. Output:\n{}", status, out);
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
         let gw_res = client.get(format!("http://127.0.0.1:{}/health", gw_port)).send().await;
         let ctrl_res = client.get(format!("http://127.0.0.1:{}/api/v1/health", ctrl_port)).send().await;
@@ -202,9 +252,10 @@ exclude_chinese_public_holidays = true
         .json(&serde_json::json!({
             "session_id": "test-session-e2e-01",
             "client_type": "opencode",
+            "client_instance_id": "inst_daemon_test",
             "turn_id": "turn-001",
             "model": "deepseek-chat",
-            "provider": "deepseek_direct",
+            "provider_id": "deepseek_direct",
             "schedule_id": "deepseek_test_sched",
             "is_active": true
         }))
@@ -213,11 +264,12 @@ exclude_chinese_public_holidays = true
         .unwrap();
     assert_eq!(reg_resp.status(), reqwest::StatusCode::OK);
 
-    // Heartbeat de sesión
+    // Heartbeat de sesión con client_instance_id
     let hb_resp = client
         .post(format!("http://127.0.0.1:{}/api/v1/sessions/heartbeat", ctrl_port))
         .header("Authorization", format!("Bearer {}", auth_token))
         .json(&serde_json::json!({
+            "client_instance_id": "inst_daemon_test",
             "session_id": "test-session-e2e-01",
             "turn_id": "turn-001",
             "is_active": true
@@ -227,11 +279,14 @@ exclude_chinese_public_holidays = true
         .unwrap();
     assert_eq!(hb_resp.status(), reqwest::StatusCode::OK);
 
-    // 6. T17.1: Validación estricta de acuses (Rechazo de solicitud sin 'success' explícito -> 422)
+    // 6. T17.1 / T18.3: Validación estricta de acuses
+    // Rechazo de solicitud sin 'success' explícito -> 422
     let ack_no_success = client
         .post(format!("http://127.0.0.1:{}/api/v1/adapters/stop-ack", ctrl_port))
         .header("Authorization", format!("Bearer {}", auth_token))
         .json(&serde_json::json!({
+            "command_id": "cmd_test_daemon_01",
+            "client_instance_id": "inst_daemon_test",
             "session_id": "test-session-ack-invalid",
             "transition_utc": "2026-10-15T01:00:00Z"
         }))
@@ -240,8 +295,8 @@ exclude_chinese_public_holidays = true
         .unwrap();
     assert_eq!(ack_no_success.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 
-    // Stop ACK exitoso autorizado
-    let ack_ok_resp = client
+    // Rechazo de solicitud sin 'command_id' -> 400
+    let ack_no_cmd = client
         .post(format!("http://127.0.0.1:{}/api/v1/adapters/stop-ack", ctrl_port))
         .header("Authorization", format!("Bearer {}", auth_token))
         .json(&serde_json::json!({
@@ -253,13 +308,30 @@ exclude_chinese_public_holidays = true
         .send()
         .await
         .unwrap();
+    assert_eq!(ack_no_cmd.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Stop ACK exitoso autorizado para comando existente
+    let ack_ok_resp = client
+        .post(format!("http://127.0.0.1:{}/api/v1/adapters/stop-ack", ctrl_port))
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&serde_json::json!({
+            "command_id": "cmd_test_daemon_01",
+            "client_instance_id": "inst_daemon_test",
+            "session_id": "test-session-ack-ok",
+            "transition_utc": "2026-10-15T01:00:00Z",
+            "success": true
+        }))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(ack_ok_resp.status(), reqwest::StatusCode::OK);
 
-    // Stop ACK con fallo autorizado
+    // Stop ACK con fallo autorizado para comando existente
     let ack_fail_resp = client
         .post(format!("http://127.0.0.1:{}/api/v1/adapters/stop-ack", ctrl_port))
         .header("Authorization", format!("Bearer {}", auth_token))
         .json(&serde_json::json!({
+            "command_id": "cmd_test_daemon_02",
             "client_instance_id": "inst_daemon_test",
             "session_id": "test-session-ack-fail",
             "transition_utc": "2026-10-15T01:00:00Z",
@@ -311,6 +383,7 @@ exclude_chinese_public_holidays = true
 
     assert!(exit_status.success(), "El proceso daemon terminó con código de error");
     let _ = std::fs::remove_file(&tmp_config_path);
+    let _ = std::fs::remove_file(&tmp_commands_path);
 }
 
 #[tokio::test]

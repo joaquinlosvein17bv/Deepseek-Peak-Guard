@@ -242,6 +242,7 @@ server.listen(0, "127.0.0.1", async () => {
           command_id: "cmd_stop_002",
           client_instance_id: OPENCODE_INSTANCE_ID,
           session_id: "session-failing-1",
+          turn_id: "turn-fail",
           transition_utc: "2026-10-15T01:00:00Z",
         })}\n\n`
       );

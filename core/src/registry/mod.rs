@@ -318,64 +318,94 @@ impl StopCommandManager {
         }
     }
 
-    pub fn with_persistence(path: std::path::PathBuf) -> Self {
+    pub fn with_persistence(path: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut commands = HashMap::new();
         if path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(loaded) = serde_json::from_str::<Vec<StopCommand>>(&data) {
-                    let now = Utc::now();
-                    for mut cmd in loaded {
-                        let age = now.signed_duration_since(cmd.created_at);
-                        if age.num_minutes() >= 10 && cmd.status == StopCommandStatus::Pending {
-                            cmd.status = StopCommandStatus::Expired;
-                            cmd.ack_error = Some("Expirado tras reinicio del daemon (>10m)".to_string());
-                        }
-                        commands.insert(cmd.command_id.clone(), cmd);
-                    }
+            let data = match std::fs::read_to_string(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("Error leyendo archivo de comandos persistidos ('{}'): {}. Fail-closed.", path.display(), e);
+                    return Err(format!("Error leyendo archivo de comandos persistidos ('{}'): {}", path.display(), e).into());
                 }
+            };
+            let loaded: Vec<StopCommand> = match serde_json::from_str(&data) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Archivo de comandos persistidos corrupto ('{}'): {}. Fail-closed sin sobrescribir.", path.display(), e);
+                    return Err(format!("Archivo de comandos persistidos corrupto ('{}'): {}", path.display(), e).into());
+                }
+            };
+
+            let now = Utc::now();
+            for mut cmd in loaded {
+                let age = now.signed_duration_since(cmd.created_at);
+                if age.num_minutes() >= 10 && cmd.status == StopCommandStatus::Pending {
+                    cmd.status = StopCommandStatus::Expired;
+                    cmd.ack_error = Some("Expirado tras reinicio del daemon (>10m)".to_string());
+                }
+                commands.insert(cmd.command_id.clone(), cmd);
             }
         }
+
         let mgr = Self {
             commands: RwLock::new(commands),
-            persistence_path: Some(path),
+            persistence_path: Some(path.clone()),
         };
-        mgr.persist_to_disk();
-        mgr
+
+        if path.exists() {
+            mgr.persist_to_disk()?;
+        }
+        Ok(mgr)
     }
 
-    fn persist_to_disk(&self) {
+    pub fn persist_to_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref path) = self.persistence_path {
-            let map = match self.commands.read() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
+            let map = self.commands.read().map_err(|e| format!("Lock poisoned: {}", e))?;
             let list: Vec<StopCommand> = map.values().cloned().collect();
             drop(map);
 
-            if let Ok(json) = serde_json::to_string_pretty(&list) {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-                if let Ok(mut f) = std::fs::File::create(&tmp_path) {
-                    use std::io::Write;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Ok(perms) = f.metadata().map(|m| m.permissions()) {
-                            let mut p = perms;
-                            p.set_mode(0o600);
-                            let _ = f.set_permissions(p);
-                        }
+            let json = serde_json::to_string_pretty(&list)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp_path = path.with_extension(format!("tmp.{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp_path)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(perms) = f.metadata().map(|m| m.permissions()) {
+                        let mut p = perms;
+                        p.set_mode(0o600);
+                        let _ = f.set_permissions(p);
                     }
-                    if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
-                        let _ = std::fs::rename(&tmp_path, path);
-                    } else {
-                        let _ = std::fs::remove_file(&tmp_path);
+                }
+                f.write_all(json.as_bytes())?;
+                f.sync_all()?;
+            }
+
+            // Sustitución atómica y segura compatible con Windows
+            let mut renamed = false;
+            let mut last_err = None;
+            for _ in 0..5 {
+                match std::fs::rename(&tmp_path, path) {
+                    Ok(_) => {
+                        renamed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 }
             }
+            if !renamed {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(Box::new(last_err.unwrap()));
+            }
         }
+        Ok(())
     }
 
     pub fn get_command(&self, command_id: &str) -> Option<StopCommand> {
@@ -396,7 +426,7 @@ impl StopCommandManager {
         }
         drop(map);
         if changed {
-            self.persist_to_disk();
+            let _ = self.persist_to_disk();
         }
     }
 
@@ -410,7 +440,7 @@ impl StopCommandManager {
         model: &str,
         transition_utc: &str,
         reason: &str,
-    ) -> StopCommand {
+    ) -> Result<StopCommand, String> {
         let command_id = format!(
             "cmd_{}_{}_{}",
             Utc::now().timestamp_millis(),
@@ -436,8 +466,10 @@ impl StopCommandManager {
         let mut map = self.commands.write().unwrap();
         map.insert(command_id, cmd.clone());
         drop(map);
-        self.persist_to_disk();
-        cmd
+        if let Err(e) = self.persist_to_disk() {
+            return Err(format!("Fallo persistiendo nueva orden Stop: {}", e));
+        }
+        Ok(cmd)
     }
 
     pub fn get_pending_commands_for_instance(&self, client_instance_id: &str) -> Vec<StopCommand> {
@@ -450,8 +482,8 @@ impl StopCommandManager {
 
     pub fn record_ack(
         &self,
-        command_id: Option<&str>,
-        client_instance_id: Option<&str>,
+        command_id: &str,
+        client_instance_id: &str,
         session_id: &str,
         turn_id: Option<&str>,
         success: bool,
@@ -459,126 +491,74 @@ impl StopCommandManager {
     ) -> Result<StopCommand, String> {
         let mut map = self.commands.write().unwrap();
 
-        // 1. Si viene command_id explícito, validar pertenencia e idempotencia
-        if let Some(cid) = command_id {
-            if let Some(cmd) = map.get_mut(cid) {
-                if let Some(inst_id) = client_instance_id {
-                    if !cmd.client_instance_id.is_empty()
-                        && cmd.client_instance_id != "default_instance"
-                        && cmd.client_instance_id != inst_id
-                    {
-                        return Err(format!(
-                            "Instancia no autorizada: command_id '{}' pertenece a '{}', pero fue respondido por '{}'",
-                            cid, cmd.client_instance_id, inst_id
-                        ));
-                    }
-                }
-                if cmd.session_id != session_id {
+        // 1. T18.3.2: Exigir command_id obligatorio y correspondencia exacta (sin fallbacks)
+        let cmd = match map.get_mut(command_id) {
+            Some(c) => c,
+            None => {
+                return Err(format!("Comando con command_id '{}' no encontrado en el registro", command_id));
+            }
+        };
+
+        if !cmd.client_instance_id.is_empty()
+            && cmd.client_instance_id != "default_instance"
+            && cmd.client_instance_id != client_instance_id
+        {
+            return Err(format!(
+                "Instancia no autorizada: command_id '{}' pertenece a '{}', pero fue respondido por '{}'",
+                command_id, cmd.client_instance_id, client_instance_id
+            ));
+        }
+
+        if cmd.session_id != session_id {
+            return Err(format!(
+                "Sesión discordante: command_id '{}' pertenece a sesión '{}', pero fue respondido para '{}'",
+                command_id, cmd.session_id, session_id
+            ));
+        }
+
+        // T18.3.2: Si la orden original tenía turn_id, el ACK debe coincidir exactamente
+        if let Some(ref cmd_turn) = cmd.turn_id {
+            match turn_id {
+                Some(ack_turn) if ack_turn == cmd_turn => {}
+                Some(ack_turn) => {
                     return Err(format!(
-                        "Sesión discordante: command_id '{}' pertenece a sesión '{}', pero fue respondido para '{}'",
-                        cid, cmd.session_id, session_id
+                        "Turno discordante: command_id '{}' pertenece a turno '{}', pero fue respondido para turno '{}'",
+                        command_id, cmd_turn, ack_turn
                     ));
                 }
-                if let (Some(cmd_turn), Some(ack_turn)) = (cmd.turn_id.as_deref(), turn_id) {
-                    if cmd_turn != ack_turn {
-                        return Err(format!(
-                            "Turno discordante: command_id '{}' pertenece a turno '{}', pero fue respondido para turno '{}'",
-                            cid, cmd_turn, ack_turn
-                        ));
-                    }
+                None => {
+                    return Err(format!(
+                        "Turno ausente: command_id '{}' requiere turno '{}', pero el ACK no incluyó turn_id",
+                        command_id, cmd_turn
+                    ));
                 }
-
-                // Idempotencia: si ya está en estado terminal, retornar estado sin duplicar acciones ni mutar
-                if cmd.status == StopCommandStatus::Acknowledged
-                    || cmd.status == StopCommandStatus::Failed
-                    || cmd.status == StopCommandStatus::Expired
-                {
-                    return Ok(cmd.clone());
-                }
-
-                cmd.status = if success {
-                    StopCommandStatus::Acknowledged
-                } else {
-                    StopCommandStatus::Failed
-                };
-                cmd.acked_at = Some(Utc::now());
-                cmd.ack_success = Some(success);
-                cmd.ack_error = error;
-                let res = cmd.clone();
-                drop(map);
-                self.persist_to_disk();
-                return Ok(res);
-            } else {
-                return Err(format!("Comando con command_id '{}' no encontrado en el registro", cid));
             }
         }
 
-        // 2. Si no viene command_id, buscar comando pendiente coincidente
-        let found_id = map
-            .values()
-            .find(|c| {
-                c.status == StopCommandStatus::Pending
-                    && c.session_id == session_id
-                    && client_instance_id.map(|inst| c.client_instance_id == inst).unwrap_or(true)
-                    && (turn_id.is_none() || c.turn_id.as_deref() == turn_id)
-            })
-            .map(|c| c.command_id.clone());
+        // Idempotencia: si ya está en estado terminal, retornar estado sin duplicar acciones ni mutar
+        if cmd.status == StopCommandStatus::Acknowledged
+            || cmd.status == StopCommandStatus::Failed
+            || cmd.status == StopCommandStatus::Expired
+        {
+            return Ok(cmd.clone());
+        }
 
-        if let Some(cid) = found_id {
-            let cmd = map.get_mut(&cid).unwrap();
-            cmd.status = if success {
-                StopCommandStatus::Acknowledged
-            } else {
-                StopCommandStatus::Failed
-            };
-            cmd.acked_at = Some(Utc::now());
-            cmd.ack_success = Some(success);
-            cmd.ack_error = error;
-            let res = cmd.clone();
-            drop(map);
-            self.persist_to_disk();
-            Ok(res)
+        cmd.status = if success {
+            StopCommandStatus::Acknowledged
         } else {
-            // Revisar si ya existe un comando terminal coincidente para evitar crear duplicados o mutar
-            let terminal_cmd = map
-                .values()
-                .find(|c| {
-                    (c.status == StopCommandStatus::Acknowledged
-                        || c.status == StopCommandStatus::Failed
-                        || c.status == StopCommandStatus::Expired)
-                        && c.session_id == session_id
-                        && client_instance_id.map(|inst| c.client_instance_id == inst).unwrap_or(true)
-                        && (turn_id.is_none() || c.turn_id.as_deref() == turn_id)
-                })
-                .cloned();
+            StopCommandStatus::Failed
+        };
+        cmd.acked_at = Some(Utc::now());
+        cmd.ack_success = Some(success);
+        cmd.ack_error = error;
+        let res = cmd.clone();
+        drop(map);
 
-            if let Some(term) = terminal_cmd {
-                return Ok(term);
-            }
-
-            // No hay comando pendiente: registrar acuse seguro para no fallar cliente legacy
-            let fallback_id = format!("ack_legacy_{}", Utc::now().timestamp_millis());
-            let cmd = StopCommand {
-                command_id: fallback_id.clone(),
-                client_type: "unknown".to_string(),
-                client_instance_id: client_instance_id.unwrap_or("default_instance").to_string(),
-                session_id: session_id.to_string(),
-                turn_id: turn_id.map(|t| t.to_string()),
-                provider_id: "unknown".to_string(),
-                model: "unknown".to_string(),
-                transition_utc: Utc::now().to_rfc3339(),
-                reason: "Stop ack legacy sin comando previo".to_string(),
-                created_at: Utc::now(),
-                status: if success { StopCommandStatus::Acknowledged } else { StopCommandStatus::Failed },
-                acked_at: Some(Utc::now()),
-                ack_success: Some(success),
-                ack_error: error,
-            };
-            map.insert(fallback_id, cmd.clone());
-            drop(map);
-            self.persist_to_disk();
-            Ok(cmd)
+        if let Err(e) = self.persist_to_disk() {
+            return Err(format!("Fallo persistiendo acuse en disco: {}", e));
         }
+
+        Ok(res)
     }
 }
 
@@ -601,14 +581,15 @@ impl SessionRegistry {
         Self::default()
     }
 
-    pub fn with_persistence_path(path: std::path::PathBuf) -> Self {
-        Self {
+    pub fn with_persistence_path(path: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let cmd_mgr = StopCommandManager::with_persistence(path)?;
+        Ok(Self {
             sessions: RwLock::new(HashMap::new()),
-            command_manager: std::sync::Arc::new(StopCommandManager::with_persistence(path)),
-        }
+            command_manager: std::sync::Arc::new(cmd_mgr),
+        })
     }
 
-    pub fn new_with_persistence() -> Self {
+    pub fn new_with_persistence() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let commands_path = if let Ok(p) = std::env::var("PEAKGUARD_COMMANDS_PATH") {
             std::path::PathBuf::from(p)
         } else {
@@ -630,33 +611,24 @@ impl SessionRegistry {
         map.insert(key, session);
     }
 
+    pub fn get_active_sessions(&self) -> Vec<ActiveSession> {
+        let map = self.sessions.read().unwrap();
+        map.values().cloned().collect()
+    }
+
     pub fn heartbeat(
         &self,
-        client_instance_id: Option<&str>,
+        client_instance_id: &str,
         session_id: &str,
         turn_id: Option<String>,
         is_active: Option<bool>,
     ) -> bool {
-        let mut map = self.sessions.write().unwrap();
-        // 1. Si viene client_instance_id, buscar coincidencia exacta
-        if let Some(inst_id) = client_instance_id {
-            for s in map.values_mut() {
-                if s.session_id == session_id && s.client_instance_id == inst_id {
-                    s.last_heartbeat = Utc::now();
-                    if let Some(t) = turn_id {
-                        s.turn_id = Some(t);
-                    }
-                    if let Some(active) = is_active {
-                        s.is_active = active;
-                    }
-                    return true;
-                }
-            }
+        if client_instance_id.trim().is_empty() {
+            return false;
         }
-
-        // 2. Fallback por session_id
+        let mut map = self.sessions.write().unwrap();
         for s in map.values_mut() {
-            if s.session_id == session_id {
+            if s.session_id == session_id && s.client_instance_id == client_instance_id {
                 s.last_heartbeat = Utc::now();
                 if let Some(t) = turn_id {
                     s.turn_id = Some(t);
@@ -667,17 +639,17 @@ impl SessionRegistry {
                 return true;
             }
         }
-
         false
     }
 
-    pub fn unregister(&self, client_instance_id: Option<&str>, session_id: &str) {
-        let mut map = self.sessions.write().unwrap();
-        if let Some(inst_id) = client_instance_id {
-            map.retain(|_, s| !(s.session_id == session_id && s.client_instance_id == inst_id));
-        } else {
-            map.retain(|_, s| s.session_id != session_id);
+    pub fn unregister(&self, client_instance_id: &str, session_id: &str) -> bool {
+        if client_instance_id.trim().is_empty() {
+            return false;
         }
+        let mut map = self.sessions.write().unwrap();
+        let prev_len = map.len();
+        map.retain(|_, s| !(s.session_id == session_id && s.client_instance_id == client_instance_id));
+        map.len() < prev_len
     }
 
     pub fn get_active_sessions_for_schedule(
@@ -776,14 +748,15 @@ mod tests {
         assert_eq!(registry.count_active(), 1);
 
         // Heartbeat con client_instance_id
-        let updated = registry.heartbeat(Some("inst_1"), "s1", Some("t2".to_string()), Some(true));
+        let updated = registry.heartbeat("inst_1", "s1", Some("t2".to_string()), Some(true));
         assert!(updated);
 
         // Heartbeat para sesión inexistente
-        assert!(!registry.heartbeat(None, "nonexistent", None, None));
+        assert!(!registry.heartbeat("inst_nonexistent", "nonexistent", None, None));
 
         // Desregistrar sesión
-        registry.unregister(Some("inst_1"), "s1");
+        let unregistered = registry.unregister("inst_1", "s1");
+        assert!(unregistered);
         assert_eq!(registry.count_active(), 0);
     }
 
@@ -803,14 +776,14 @@ mod tests {
         assert_eq!(registry.count_active(), 2);
 
         // Heartbeat a inst_alpha solo afecta a inst_alpha
-        assert!(registry.heartbeat(Some("inst_alpha"), "session_common", Some("turn_a1".to_string()), Some(true)));
+        assert!(registry.heartbeat("inst_alpha", "session_common", Some("turn_a1".to_string()), Some(true)));
 
         // Unregister de inst_alpha no debe borrar inst_beta
-        registry.unregister(Some("inst_alpha"), "session_common");
+        assert!(registry.unregister("inst_alpha", "session_common"));
         assert_eq!(registry.count_active(), 1);
 
         // inst_beta sigue activa
-        assert!(registry.heartbeat(Some("inst_beta"), "session_common", None, None));
+        assert!(registry.heartbeat("inst_beta", "session_common", None, None));
     }
 
     #[test]
@@ -828,7 +801,7 @@ mod tests {
             "deepseek-reasoner",
             &Utc::now().to_rfc3339(),
             "Entrada en pico",
-        );
+        ).unwrap();
 
         assert_eq!(cmd.status, StopCommandStatus::Pending);
         assert_eq!(cmd.client_instance_id, "inst_pi_99");
@@ -844,8 +817,8 @@ mod tests {
 
         // 3. Intento de ACK por instancia ajena debe fallar (403 / Err)
         let foreign_ack = mgr.record_ack(
-            Some(&cmd.command_id),
-            Some("inst_imposter"),
+            &cmd.command_id,
+            "inst_imposter",
             "sess_42",
             Some("turn_9"),
             true,
@@ -855,8 +828,8 @@ mod tests {
 
         // 4. ACK válido por la instancia legítima
         let valid_ack = mgr.record_ack(
-            Some(&cmd.command_id),
-            Some("inst_pi_99"),
+            &cmd.command_id,
+            "inst_pi_99",
             "sess_42",
             Some("turn_9"),
             true,
@@ -872,8 +845,8 @@ mod tests {
 
         // 5. ACK repetido es idempotente y no falla
         let dup_ack = mgr.record_ack(
-            Some(&cmd.command_id),
-            Some("inst_pi_99"),
+            &cmd.command_id,
+            "inst_pi_99",
             "sess_42",
             Some("turn_9"),
             true,

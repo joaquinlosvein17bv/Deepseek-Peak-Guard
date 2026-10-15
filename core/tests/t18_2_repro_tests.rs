@@ -143,7 +143,7 @@ async fn test_repro_stop_ack_must_require_mandatory_client_instance_and_prevent_
         "deepseek-chat",
         &Utc::now().to_rfc3339(),
         "Prueba de Stop ACK estricto",
-    );
+    ).unwrap();
 
     // 1. Intento de enviar Stop ACK SIN client_instance_id: DEBE RECHAZARSE (400)
     let res_missing_instance = client
@@ -243,7 +243,7 @@ async fn test_repro_stop_recovery_after_daemon_restart() {
     let commands_file = temp_dir.join("pending_commands.json");
 
     // Instancia 1 del SessionRegistry con persistencia
-    let reg1 = SessionRegistry::with_persistence_path(commands_file.clone());
+    let reg1 = SessionRegistry::with_persistence_path(commands_file.clone()).unwrap();
     let cmd_mgr1 = reg1.get_command_manager();
 
     // 1. Crear comando reciente (debe recuperarse como Pending)
@@ -256,7 +256,7 @@ async fn test_repro_stop_recovery_after_daemon_restart() {
         "deepseek-chat",
         &Utc::now().to_rfc3339(),
         "Orden reciente",
-    );
+    ).unwrap();
 
     // 2. Crear comando viejo (> 10 minutos)
     // Para simularlo de forma determinista, escribimos en el archivo JSON una orden con timestamp de hace 15 minutos
@@ -270,7 +270,7 @@ async fn test_repro_stop_recovery_after_daemon_restart() {
         "deepseek-chat",
         &old_timestamp.to_rfc3339(),
         "Orden vieja",
-    );
+    ).unwrap();
 
     // Modificar manualmente el JSON para que cmd_old tenga created_at hace 15 minutos
     let json_str = std::fs::read_to_string(&commands_file).unwrap();
@@ -286,7 +286,7 @@ async fn test_repro_stop_recovery_after_daemon_restart() {
     drop(reg1);
 
     // REINICIO DEL DAEMON: Instancia 2 del SessionRegistry leyendo el mismo archivo
-    let reg2 = SessionRegistry::with_persistence_path(commands_file.clone());
+    let reg2 = SessionRegistry::with_persistence_path(commands_file.clone()).unwrap();
     let cmd_mgr2 = reg2.get_command_manager();
 
     // Verificar orden reciente: debe seguir Pending
@@ -300,8 +300,8 @@ async fn test_repro_stop_recovery_after_daemon_restart() {
 
     // Procesar ACK exitoso para la orden reciente recuperada
     let ack_res = cmd_mgr2.record_ack(
-        Some(&cmd_recent.command_id),
-        Some("inst_restart_01"),
+        &cmd_recent.command_id,
+        "inst_restart_01",
         "sess_recent",
         Some("turn-1"),
         true,
@@ -311,7 +311,7 @@ async fn test_repro_stop_recovery_after_daemon_restart() {
 
     // REINICIO 2 DEL DAEMON: Verificar que el estado terminal Acknowledged persiste
     drop(reg2);
-    let reg3 = SessionRegistry::with_persistence_path(commands_file.clone());
+    let reg3 = SessionRegistry::with_persistence_path(commands_file.clone()).unwrap();
     let cmd_mgr3 = reg3.get_command_manager();
     let terminal_recovered = cmd_mgr3.get_command(&cmd_recent.command_id).expect("Debe existir");
     assert_eq!(terminal_recovered.status, StopCommandStatus::Acknowledged);

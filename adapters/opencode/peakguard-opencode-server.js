@@ -264,10 +264,9 @@ export function startEventSubscriber(client) {
     }, delay);
   }
 
-  // Procesar orden Stop (T18.1.2, T18.1.3, T18.1.6, T18.2.2)
+  // Procesar orden Stop (T18.1.2, T18.1.3, T18.1.6, T18.2.2, T18.3.1)
   async function handleStopOrder(event) {
     const sessionID = event.session_id;
-    const turnID = event.turn_id || null;
 
     // Validación de client_instance_id si viene especificado
     if (event.client_instance_id && event.client_instance_id !== CLIENT_INSTANCE_ID) {
@@ -283,23 +282,8 @@ export function startEventSubscriber(client) {
       return;
     }
 
-    // T18.2.2: Validación estricta de turn_id para evitar abortar turnos nuevos
-    // 1. Una orden antigua (turn_id anterior) NUNCA debe cancelar un turno nuevo
-    if (turnID && currentSess.turnID && currentSess.turnID !== turnID) {
-      console.warn(
-        `[PeakGuard:OpenCode] Orden Stop antigua descartada: orden para '${turnID}', pero turno activo actual es '${currentSess.turnID}'. No se aborta el turno nuevo.`
-      );
-      await sendStopAck(
-        sessionID,
-        event.transition_utc,
-        false,
-        `turn_mismatch: orden para '${turnID}', pero turno actual es '${currentSess.turnID}'`,
-        turnID,
-        event.command_id,
-        CLIENT_INSTANCE_ID
-      );
-      return;
-    }
+    const turnID = typeof event.turn_id === "string" ? event.turn_id.trim() : null;
+    const currentTurn = typeof currentSess.turnID === "string" ? currentSess.turnID.trim() : null;
 
     // 2. Si la sesión no tiene un turno en ejecución activa, descartar
     if (!currentSess.isActive) {
@@ -311,25 +295,47 @@ export function startEventSubscriber(client) {
         event.transition_utc,
         true,
         null,
-        turnID || currentSess.turnID,
+        turnID || currentTurn,
         event.command_id,
         CLIENT_INSTANCE_ID
       );
       return;
     }
 
-    // 3. Si no existe identidad de turno verificable en el cliente, evitar abort ambiguo
-    if (!turnID && !currentSess.turnID) {
-      const abortError = "unverifiable_turn_identity_fallback_to_gateway";
+    // T18.3.1: Exigir coincidencia verificable entre instancia, sesión y turno antes de invocar un abort nativo.
+    // Si falta event.turn_id o la identidad actual no puede comprobarse, no ejecutar un abort ambiguo.
+    if (!turnID || !currentTurn) {
+      const abortError = !turnID && !currentTurn
+        ? "unverifiable_turn_identity: turno ausente en la orden y en la sesión"
+        : !turnID
+        ? "unverifiable_turn_identity: event.turn_id ausente en la orden de Stop"
+        : "unverifiable_turn_identity: la sesión actual no tiene un turno activo comprobable";
       console.warn(
-        `[PeakGuard:OpenCode] Identidad de turno no verificable en sesión '${sessionID}'. Evitando abort ambiguo y aplicando fallback de gateway.`
+        `[PeakGuard:OpenCode] ${abortError}. Evitando abort ambiguo y aplicando fallback de gateway.`
       );
       await sendStopAck(
         sessionID,
         event.transition_utc,
         false,
         abortError,
-        null,
+        turnID || currentTurn,
+        event.command_id,
+        CLIENT_INSTANCE_ID
+      );
+      return;
+    }
+
+    // T18.2.2 & T18.3.1: Una orden antigua (turn_id anterior) NUNCA debe cancelar un turno nuevo
+    if (turnID !== currentTurn) {
+      console.warn(
+        `[PeakGuard:OpenCode] Orden Stop antigua descartada: orden para '${turnID}', pero turno activo actual es '${currentTurn}'. No se aborta el turno nuevo.`
+      );
+      await sendStopAck(
+        sessionID,
+        event.transition_utc,
+        false,
+        `turn_mismatch: orden para '${turnID}', pero turno actual es '${currentTurn}'`,
+        turnID,
         event.command_id,
         CLIENT_INSTANCE_ID
       );
@@ -337,15 +343,14 @@ export function startEventSubscriber(client) {
     }
 
     // Deduplicar órdenes de Stop repetidas por command_id o clave compuesta
-    const effectiveTurn = turnID || currentSess.turnID || "";
-    const stopKey = event.command_id || `${sessionID}:${effectiveTurn}:${event.transition_utc || ""}`;
+    const stopKey = event.command_id || `${sessionID}:${turnID}:${event.transition_utc || ""}`;
     if (processedStopKeys.has(stopKey)) {
       return;
     }
     processedStopKeys.add(stopKey);
 
     console.warn(
-      `[PeakGuard:OpenCode] Recibida orden de Stop nativo válida para sesión '${sessionID}' (turno '${effectiveTurn}'). Abortando turno activo...`
+      `[PeakGuard:OpenCode] Recibida orden de Stop nativo válida para sesión '${sessionID}' (turno '${turnID}'). Abortando turno activo...`
     );
 
     let abortSuccess = false;
@@ -358,7 +363,7 @@ export function startEventSubscriber(client) {
         await client.session.abort({ path: { id: sessionID } });
         abortSuccess = true;
         console.info(
-          `[PeakGuard:OpenCode] Turno '${effectiveTurn}' abortado exitosamente mediante client.session.abort({ id: '${sessionID}' }).`
+          `[PeakGuard:OpenCode] Turno '${turnID}' abortado exitosamente mediante client.session.abort({ id: '${sessionID}' }).`
         );
       } catch (err) {
         abortSuccess = false;
@@ -377,7 +382,7 @@ export function startEventSubscriber(client) {
       event.transition_utc,
       abortSuccess,
       abortError,
-      effectiveTurn,
+      turnID,
       event.command_id,
       CLIENT_INSTANCE_ID
     );
