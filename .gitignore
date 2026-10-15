@@ -1,0 +1,24 @@
+# Binaries and build outputs
+target/
+bin/
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Environment and secrets
+.env
+*.local
+*.log
+
+# State and caches
+*.state.json
+__pycache__/
+.cache/
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
