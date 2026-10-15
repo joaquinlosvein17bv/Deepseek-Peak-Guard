@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\Users\\meliodaslosven\\scoop\\apps\\mingw\\current\\bin\\gcc.exe"
+ar = "C:\\Users\\meliodaslosven\\scoop\\apps\\mingw\\current\\bin\\ar.exe"
+
+[build]
+target = "x86_64-pc-windows-gnu"
