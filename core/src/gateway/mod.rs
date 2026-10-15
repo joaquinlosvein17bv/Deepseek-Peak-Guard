@@ -189,6 +189,36 @@ async fn handle_chat_completions(
                 .unwrap_or(StatusCode::BAD_GATEWAY);
             let resp_headers = upstream_resp.headers().clone();
 
+            // Si es un stream SSE (`stream: true` o `text/event-stream`)
+            let is_sse = resp_headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("text/event-stream"))
+                .unwrap_or(false);
+
+            if is_sse {
+                let stream_bytes = upstream_resp.bytes_stream();
+                let mut response = axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", "text/event-stream")
+                    .header("cache-control", "no-cache")
+                    .header("connection", "keep-alive")
+                    .body(axum::body::Body::from_stream(stream_bytes))
+                    .unwrap();
+
+                for (k, v) in resp_headers {
+                    if let Some(name) = k {
+                        if name.as_str() != "content-length"
+                            && name.as_str() != "transfer-encoding"
+                            && name.as_str() != "content-type"
+                        {
+                            response.headers_mut().insert(name, v);
+                        }
+                    }
+                }
+                return response;
+            }
+
             match upstream_resp.bytes().await {
                 Ok(resp_bytes) => {
                     let mut response = (status, resp_bytes).into_response();
@@ -213,6 +243,7 @@ async fn handle_chat_completions(
                 }
             }
         }
+
         Err(e) => {
             warn!("Error conectando con upstream '{}': {}", target_url, e);
             (
