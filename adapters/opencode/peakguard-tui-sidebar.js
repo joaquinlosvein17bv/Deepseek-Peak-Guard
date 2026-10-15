@@ -2,6 +2,7 @@
 /**
  * PeakGuard Sidebar & Statusline Widget para OpenCode TUI
  * Diseñado conforme a la especificación funcional §5.2 de PeakGuard.
+ * Compatible con OpenCode v1.18.35+ (tui.jsonc)
  */
 
 import http from "node:http";
@@ -9,18 +10,19 @@ import http from "node:http";
 const PEAKGUARD_CONTROL_URL = process.env.PEAKGUARD_CONTROL_URL || "http://127.0.0.1:8766";
 const id = "peakguard-sidebar";
 
+// Estado inicial estricto: NUNCA asumir PROTEGIDO sin validación real
 let currentState = {
   is_peak: false,
-  mode: "restricted_stop",
+  mode: "unknown",
   next_peak_utc: null,
   seconds_to_peak: null,
-  coverage: "PROTEGIDO",
+  coverage: "DISCONNECTED",
 };
 
 let countdownInterval = null;
 
 // Sincronización periódica liviana con el demonio local
-async function fetchStatus() {
+export async function fetchStatus() {
   return new Promise((resolve) => {
     http
       .get(`${PEAKGUARD_CONTROL_URL}/api/v1/status`, (res) => {
@@ -28,14 +30,23 @@ async function fetchStatus() {
         res.on("data", (chunk) => (raw += chunk));
         res.on("end", () => {
           try {
-            currentState = JSON.parse(raw);
-            resolve(currentState);
+            if (res.statusCode === 200) {
+              currentState = JSON.parse(raw);
+              resolve(currentState);
+            } else {
+              currentState.coverage = "DISCONNECTED";
+              resolve(null);
+            }
           } catch {
+            currentState.coverage = "DISCONNECTED";
             resolve(null);
           }
         });
       })
-      .on("error", () => resolve(null));
+      .on("error", () => {
+        currentState.coverage = "DISCONNECTED";
+        resolve(null);
+      });
   });
 }
 
@@ -65,28 +76,39 @@ export const tui = async (api) => {
       order: 50,
       slots: {
         sidebar_content() {
+          const isDisconnected = currentState.coverage === "DISCONNECTED";
           const isPeak = currentState.is_peak;
-          const statusDot = isPeak ? "● PEAK ACTIVO" : "● OFF-PEAK";
+          const statusDot = isDisconnected
+            ? "○ DESCONECTADO"
+            : isPeak
+            ? "● PEAK ACTIVO"
+            : "● OFF-PEAK";
           const countdown = formatCountdown(currentState.seconds_to_peak);
           const isFinalCountdown =
-            currentState.seconds_to_peak != null && currentState.seconds_to_peak <= 10 && currentState.seconds_to_peak > 0;
-          const modeStr = (currentState.mode || "restricted_stop").toUpperCase();
-          const coverageStr = currentState.coverage || "PROTEGIDO";
+            !isDisconnected &&
+            currentState.seconds_to_peak != null &&
+            currentState.seconds_to_peak <= 10 &&
+            currentState.seconds_to_peak > 0;
+          const modeStr = (currentState.mode || "unknown").toUpperCase();
+          const coverageStr = currentState.coverage || "DISCONNECTED";
 
           return {
             title: `PeakGuard [${statusDot}]`,
             lines: [
-              `Modo: ${modeStr}`,
+              `Modo: ${isDisconnected ? "DESCONECTADO" : modeStr}`,
               `Cobertura: ${coverageStr}`,
               `Próximo peak: ${currentState.next_peak_utc ? currentState.next_peak_utc.slice(11, 16) + " UTC" : (isPeak ? "En curso" : "--:-- UTC")}`,
               isFinalCountdown
                 ? `⚠️ CUENTA ATRÁS: ${currentState.seconds_to_peak}s`
-                : `Cuenta atrás: ${countdown}`,
+                : `Cuenta atrás: ${isDisconnected ? "--:--:--" : countdown}`,
               `Alertas: 30 · 10 · 5 min`,
             ],
           };
         },
         status_bar() {
+          if (currentState.coverage === "DISCONNECTED") {
+            return "⚠️ PeakGuard: DESCONECTADO";
+          }
           const isPeak = currentState.is_peak;
           const label = isPeak
             ? "⛔ PeakGuard: PEAK"

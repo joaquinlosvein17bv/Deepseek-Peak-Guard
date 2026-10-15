@@ -3,67 +3,131 @@
  * Ubicación recomendada: ~/.pi/agent/extensions/peakguard.ts
  *
  * Implementa la integración real conforme a la API de extensiones de Pi:
+ * - Autenticación con Bearer Token desde entorno o ~/.peakguard/control.token
  * - Registra callbacks con pi.on("session_start"), pi.on("agent_start"), pi.on("turn_start").
+ * - Registra sesiones activas en el demonio central de PeakGuard.
  * - Retiene el contexto activo del turno para invocar ctx.abort() o pi.abort() sin matar el proceso.
  * - Reporta acuses de recibo (Stop ACK) distinguiendo éxitos de fallos reales (sin falsos positivos).
  */
 
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 
 const PEAKGUARD_CONTROL_URL = process.env.PEAKGUARD_CONTROL_URL || "http://127.0.0.1:8766";
 const SOURCE = "peakguard:pi";
 
-export async function getPeakGuardStatus(): Promise<any> {
+let cachedToken: string | null = null;
+
+export function getAuthToken(): string | null {
+  if (cachedToken) return cachedToken;
+  if (process.env.PEAKGUARD_CONTROL_TOKEN) {
+    cachedToken = process.env.PEAKGUARD_CONTROL_TOKEN.trim();
+    return cachedToken;
+  }
+  const tokenFile = path.join(os.homedir(), ".peakguard", "control.token");
+  try {
+    if (fs.existsSync(tokenFile)) {
+      cachedToken = fs.readFileSync(tokenFile, "utf-8").trim();
+      return cachedToken;
+    }
+  } catch {
+    // Continuar sin token si falla la lectura
+  }
+  return null;
+}
+
+export async function sendControlRequest(
+  endpoint: string,
+  method = "GET",
+  body: any = null
+): Promise<{ statusCode: number; body?: any; error?: any }> {
+  const token = getAuthToken();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const payload = body ? JSON.stringify(body) : null;
+  if (payload) {
+    headers["Content-Length"] = String(Buffer.byteLength(payload));
+  }
+
+  const url = new URL(`${PEAKGUARD_CONTROL_URL}${endpoint}`);
+
   return new Promise((resolve) => {
-    http
-      .get(`${PEAKGUARD_CONTROL_URL}/api/v1/status`, (res) => {
+    const req = http.request(
+      url,
+      {
+        method,
+        headers,
+      },
+      (res) => {
         let data = "";
         res.on("data", (chunk) => (data += chunk));
         res.on("end", () => {
           try {
-            resolve(JSON.parse(data));
+            resolve({
+              statusCode: res.statusCode || 0,
+              body: data ? JSON.parse(data) : null,
+            });
           } catch {
-            resolve(null);
+            resolve({ statusCode: res.statusCode || 0, body: data });
           }
         });
-      })
-      .on("error", () => resolve(null));
+      }
+    );
+    req.on("error", (err) => resolve({ statusCode: 0, error: err }));
+    if (payload) req.write(payload);
+    req.end();
   });
+}
+
+export async function getPeakGuardStatus(): Promise<any> {
+  const res = await sendControlRequest("/api/v1/status", "GET");
+  return res.statusCode === 200 ? res.body : null;
+}
+
+export async function registerActiveSession(
+  sessionID: string,
+  turnID: string | null = null,
+  model = "deepseek-chat"
+): Promise<boolean> {
+  const res = await sendControlRequest("/api/v1/sessions/register", "POST", {
+    session_id: sessionID,
+    client_type: "pi",
+    turn_id: turnID,
+    model,
+    provider_id: "deepseek_direct",
+    is_active: true,
+  });
+  return res.statusCode === 200;
 }
 
 export async function sendStopAck(
   sessionID: string,
   transitionUtc: string,
   success: boolean,
-  error?: string
+  error?: string,
+  turnID?: string | null
 ): Promise<boolean> {
-  const payload = JSON.stringify({
+  const res = await sendControlRequest("/api/v1/adapters/stop-ack", "POST", {
     session_id: sessionID,
+    turn_id: turnID || null,
     transition_utc: transitionUtc || new Date().toISOString(),
-    success,
+    success: Boolean(success),
     error: error || null,
   });
-
-  return new Promise((resolve) => {
-    const req = http.request(
-      `${PEAKGUARD_CONTROL_URL}/api/v1/adapters/stop-ack`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-      },
-      (res) => resolve(res.statusCode === 200)
-    );
-    req.on("error", () => resolve(false));
-    req.write(payload);
-    req.end();
-  });
+  return res.statusCode === 200 || res.statusCode === 202;
 }
 
 export default function peakguardExtension(pi: any) {
   let activeCtx: any = null;
+  let activeSessionId: string = "pi-default-session";
+  let activeTurnId: string | null = null;
   let isPeakActive = false;
   let sseReq: http.ClientRequest | null = null;
 
@@ -71,21 +135,27 @@ export default function peakguardExtension(pi: any) {
   if (typeof pi?.on === "function") {
     pi.on("session_start", (_event: any, ctx: any) => {
       activeCtx = ctx;
+      activeSessionId = ctx?.sessionId || ctx?.id || "pi-session";
       updateStatusDisplay();
     });
 
     pi.on("agent_start", (_event: any, ctx: any) => {
       activeCtx = ctx;
+      activeSessionId = ctx?.sessionId || ctx?.id || activeSessionId;
       updateStatusDisplay();
     });
 
-    pi.on("turn_start", (_event: any, ctx: any) => {
+    pi.on("turn_start", async (_event: any, ctx: any) => {
       activeCtx = ctx;
+      activeTurnId = ctx?.turnId || ctx?.id || `turn-${Date.now()}`;
+      activeSessionId = ctx?.sessionId || ctx?.id || activeSessionId;
+      const model = ctx?.model || "deepseek-chat";
+      await registerActiveSession(activeSessionId, activeTurnId, model);
     });
 
-    pi.on("agent_settled", (_event: any, ctx: any) => {
+    pi.on("agent_settled", async (_event: any, ctx: any) => {
       if (activeCtx === ctx) {
-        // El turno terminó
+        activeTurnId = null;
       }
     });
   }
@@ -93,7 +163,12 @@ export default function peakguardExtension(pi: any) {
   // 2. Actualizar indicador en UI
   async function updateStatusDisplay() {
     const status = await getPeakGuardStatus();
-    if (!status) return;
+    if (!status) {
+      if (activeCtx?.ui?.setStatus) {
+        activeCtx.ui.setStatus("peakguard", "○ DESCONECTADO");
+      }
+      return;
+    }
 
     isPeakActive = status.is_peak;
     const label = isPeakActive
@@ -112,7 +187,19 @@ export default function peakguardExtension(pi: any) {
 
   // 3. Conectar a eventos SSE del Control API de PeakGuard
   function connectEvents() {
-    sseReq = http.get(`${PEAKGUARD_CONTROL_URL}/api/v1/events`, (res) => {
+    const token = getAuthToken();
+    const query = token ? `?token=${encodeURIComponent(token)}` : "";
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const url = `${PEAKGUARD_CONTROL_URL}/api/v1/events${query}`;
+
+    sseReq = http.get(url, { headers }, (res) => {
+      if (res.statusCode !== 200) {
+        setTimeout(connectEvents, 5000);
+        return;
+      }
+
       let buffer = "";
       res.on("data", async (chunk) => {
         buffer += chunk.toString();
@@ -124,9 +211,9 @@ export default function peakguardExtension(pi: any) {
             try {
               const event = JSON.parse(line.slice(6));
               if (event.type === "stop_requested") {
-                const sessionID = event.session_id || "pi-current-session";
+                const targetSession = event.session_id;
                 console.warn(
-                  `[PeakGuard:Pi] Orden de Stop recibida para '${sessionID}'. Abortando turno activo...`
+                  `[PeakGuard:Pi] Orden de Stop recibida para '${targetSession}'. Abortando turno activo...`
                 );
 
                 let success = false;
@@ -162,7 +249,7 @@ export default function peakguardExtension(pi: any) {
                 }
 
                 // Enviar acuse con status REAL (sin falsos positivos)
-                await sendStopAck(sessionID, event.transition_utc, success, errorMsg);
+                await sendStopAck(targetSession, event.transition_utc, success, errorMsg, event.turn_id);
               } else if (event.type === "peak_started" || event.type === "peak_ended") {
                 updateStatusDisplay();
               }
