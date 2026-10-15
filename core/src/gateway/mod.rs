@@ -22,6 +22,7 @@ pub struct GatewayState {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct ChatCompletionRequest {
     model: String,
     #[serde(default)]

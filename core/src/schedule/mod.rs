@@ -188,4 +188,48 @@ impl Schedule {
 
         None
     }
+
+    /// Retorna una instancia con el horario verificado oficial de DeepSeek Direct API
+    pub fn default_deepseek() -> Self {
+        Self::new(
+            "deepseek_direct_verified",
+            &["01:00-04:00".to_string(), "06:00-10:00".to_string()],
+            &[
+                "mon".to_string(),
+                "tue".to_string(),
+                "wed".to_string(),
+                "thu".to_string(),
+                "fri".to_string(),
+            ],
+            true,
+            &chinese_public_holidays_2026(),
+        )
+    }
+}
+
+/// Lista oficial de festivos públicos de China verificados para el año 2026
+pub fn chinese_public_holidays_2026() -> Vec<String> {
+    vec![
+        "2026-01-01".to_string(),
+        "2026-02-15".to_string(),
+        "2026-02-16".to_string(),
+        "2026-02-17".to_string(),
+        "2026-02-18".to_string(),
+        "2026-02-19".to_string(),
+        "2026-02-20".to_string(),
+        "2026-02-21".to_string(),
+        "2026-04-05".to_string(),
+        "2026-05-01".to_string(),
+        "2026-05-02".to_string(),
+        "2026-05-03".to_string(),
+        "2026-06-19".to_string(),
+        "2026-09-25".to_string(),
+        "2026-10-01".to_string(),
+        "2026-10-02".to_string(),
+        "2026-10-03".to_string(),
+        "2026-10-04".to_string(),
+        "2026-10-05".to_string(),
+        "2026-10-06".to_string(),
+        "2026-10-07".to_string(),
+    ]
 }

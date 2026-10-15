@@ -233,6 +233,40 @@ fn default_utc() -> String {
     "UTC".to_string()
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            config_version: 1,
+            general: GeneralConfig::default(),
+            alerts: AlertsConfig::default(),
+            gateway: GatewayConfig::default(),
+            control: ControlConfig::default(),
+            stop: StopConfig::default(),
+            telegram: TelegramConfig::default(),
+            providers: vec![ProviderConfig {
+                id: "deepseek_direct".to_string(),
+                upstream: Some("https://api.deepseek.com".to_string()),
+                enabled: true,
+                schedule_id: "deepseek_direct_verified".to_string(),
+            }],
+            schedules: vec![ScheduleConfig {
+                id: "deepseek_direct_verified".to_string(),
+                timezone: "UTC".to_string(),
+                weekdays: vec![
+                    "mon".to_string(),
+                    "tue".to_string(),
+                    "wed".to_string(),
+                    "thu".to_string(),
+                    "fri".to_string(),
+                ],
+                intervals: vec!["01:00-04:00".to_string(), "06:00-10:00".to_string()],
+                exclude_chinese_public_holidays: true,
+                source_url: Some("https://api-docs.deepseek.com/quick_start/pricing/".to_string()),
+            }],
+        }
+    }
+}
+
 impl Config {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let content = fs::read_to_string(path)?;

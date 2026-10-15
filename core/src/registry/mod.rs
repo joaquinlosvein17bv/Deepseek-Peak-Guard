@@ -128,4 +128,21 @@ impl ModelRegistry {
             None => CoverageStatus::Uncovered,
         }
     }
+
+    /// Retorna referencia al mapa interno de modelos
+    pub fn get_models(&self) -> &HashMap<String, ModelInfo> {
+        &self.models
+    }
+
+    /// Retorna referencia al mapa interno de proveedores
+    pub fn get_providers(&self) -> &HashMap<String, ProviderInfo> {
+        &self.providers
+    }
+
+    /// Retorna lista ordenada de todos los modelos registrados
+    pub fn list_all_models(&self) -> Vec<&ModelInfo> {
+        let mut list: Vec<&ModelInfo> = self.models.values().collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
+    }
 }

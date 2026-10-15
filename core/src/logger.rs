@@ -6,11 +6,16 @@ pub fn init_logger() {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(false),
+        )
         .init();
 }
 
 /// Sanitiza strings para que no aparezcan tokens o claves sensibles en los logs
+#[allow(dead_code)]
 pub fn sanitize_log(input: &str) -> String {
     let mut out = input.to_string();
     if let Some(pos) = out.find("Bearer ") {

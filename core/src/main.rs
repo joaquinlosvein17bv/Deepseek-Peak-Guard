@@ -2,6 +2,7 @@ pub mod clock;
 mod commands;
 pub mod config;
 mod logger;
+pub mod mcp;
 pub mod registry;
 pub mod schedule;
 
@@ -41,6 +42,9 @@ enum Commands {
 
     #[command(about = "Inicia el demonio de PeakGuard (Gateway + Control API + Monitor)")]
     Run,
+
+    #[command(about = "Inicia el servidor MCP (Model Context Protocol) sobre stdio para herramientas de consulta")]
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -88,6 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "No se encontró archivo de configuración. Especifique uno con --config <path>."
             })?;
             commands::run::execute(p).await?;
+        }
+        Some(Commands::Mcp) => {
+            commands::mcp::execute(config_path.as_deref()).await?;
         }
         None => {
             // Sin subcomando: muestra estado por defecto
