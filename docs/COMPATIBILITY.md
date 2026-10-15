@@ -30,29 +30,31 @@
 ## 3. Detalle de Compatibilidad por Cliente
 
 ### 3.1. OpenCode (`1.18.35`)
-- **Detección de modelo/proveedor:** Mediante hooks de plugin en `~/.config/opencode/plugins/` (eventos `session.created`, `session.status`, `tool.execute.before`).
-- **Control nativo:** La API del SDK expone `session.abort()`. El turno se cancela preservando la sesión y los mensajes previos en el historial de la TUI.
-- **Enrutamiento por Gateway:**
-  - El proveedor integrado `opencode/` almacena tokens en `~/.local/share/opencode/auth.json`.
-  - Se puede definir un proveedor alternativo en `opencode.json` con paquete `@ai-sdk/openai-compatible` apuntando a `http://127.0.0.1:8765/v1`.
-- **UI / Sidebar:** Soporta extensiones TUI vía `tui.jsonc` (slots de estado y statusline).
+- **Arquitectura de Plugins dividida:**
+  - **Servidor / Headless:** `adapters/opencode/peakguard-opencode-server.js` para `opencode.jsonc` (`"plugin": [...]`). Registra sesiones en Control API con Bearer Token, escucha eventos SSE y ejecuta `client.session.abort({ path: { id } })`.
+  - **TUI / Interfaz:** `adapters/opencode/peakguard-tui-sidebar.js` para `tui.jsonc` (`"plugin": [...]`). Renderiza widget lateral y status line con cuenta regresiva. Estado inicial estricto: `DISCONNECTED`.
+  - **Compatibilidad Unificada:** `adapters/opencode/peakguard-opencode.js` reexporta ambos componentes.
+- **Control nativo verificado:** `client.session.abort()` cancela exclusivamente el turno activo, preservando historial y pestañas.
+- **Enrutamiento por Gateway:** Paquete `@ai-sdk/openai-compatible` apuntando a `http://127.0.0.1:8765/v1`.
+- **Validación:** Probado con `adapters/tests/adapter-mock-runner.test.mjs` bajo runtime Node.js.
 
 ### 3.2. Pi (`0.87.1`)
-- **Detección de modelo/proveedor:** Extensiones en `~/.pi/agent/extensions/`.
-- **Control nativo:** Soporta `ctx.abort()`. La documentación advierte no usar `ctx.shutdown()`.
-- **Enrutamiento por Gateway:** El archivo `~/.pi/agent/models.json` permite configurar cualquier proveedor con `"api": "openai-completions"` y `"baseUrl": "http://127.0.0.1:8765/v1"`.
-- **UI:** Dispone de `ctx.ui.setStatus` y widgets compactos.
+- **Detección y seguimiento:** Extensión `adapters/pi/peakguard-pi.ts` registra sesiones activas en `turn_start` y actualiza estado en `agent_settled`.
+- **Autenticación:** Lee credencial de `~/.peakguard/control.token` o `PEAKGUARD_CONTROL_TOKEN`.
+- **Control nativo verificado:** Invocación de `activeCtx.abort()` o `pi.abort()`. El turno se cancela sin cerrar la consola interactiva ni ejecutar `shutdown()`.
+- **Enrutamiento por Gateway:** `~/.pi/agent/models.json` con `"baseUrl": "http://127.0.0.1:8765/v1"`.
 
 ### 3.3. Hermes (`0.21.4`)
 - **Detección de modelo/proveedor:** `config.yaml` define `model.provider` y `model.default`.
-- **Control nativo:** El comando `/stop` cancela la ejecución, pero puede abortar cadenas de subagentes o procesos asociados en background. Se degrada a **cancelación de stream por gateway + alerta** como mecanismo seguro primario hasta aislar el comando de parada granular.
-- **Enrutamiento por Gateway:** Inmediato; `config.yaml` incluye la clave `model.base_url: https://opencode.ai/zen/go/v1`, modificable a `http://127.0.0.1:8765/v1`.
+- **Control nativo:** El comando `/stop` cancela la ejecución, pero puede abortar cadenas de subagentes o procesos asociados en background. Se mantiene como **cancelación de stream por gateway + alerta** como mecanismo seguro primario hasta aislar el comando de parada granular.
+- **Enrutamiento por Gateway:** Inmediato; `config.yaml` incluye `model.base_url: http://127.0.0.1:8765/v1`.
 
 ---
 
 ## 4. Clasificación de Cobertura según la Especificación
 
-- **PROTEGIDO (`PROTECTED` / `VERIFIED`)**: Tráfico configurado explícitamente para pasar por el Gateway `http://127.0.0.1:8765` y/o con adaptador nativo activo y verificado en tests.
+- **PROTEGIDO (`PROTECTED`)**: Tráfico configurado explícitamente para pasar por el Gateway `http://127.0.0.1:8765` y/o con adaptador nativo activo y verificado en tests.
 - **PARCIAL (`PARTIAL`)**: Clientes donde el control nativo o el enrutamiento está sujeto a limitaciones (ej. Hermes con `/stop` amplio).
 - **NO VERIFICADO (`UNVERIFIED`)**: Proveedores o configuraciones donde el cliente gestiona la inferencia internamente o no se ha verificado el enrutamiento a través del Gateway local (ej. OpenCode Go por defecto sin custom provider configurado).
 - **NO CUBIERTO (`UNCOVERED`)**: Procesos o herramientas que apunten directamente a internet sin pasar por el loopback o sin plugin de control reportado.
+- **DESCONECTADO (`DISCONNECTED`)**: Demonio PeakGuard no responde o no está en ejecución. Nunca se reporta PROTECTED en este estado.

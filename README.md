@@ -121,19 +121,25 @@ peakguard mcp --config config\peakguard.example.toml
 
 ## 🧪 Pruebas y Verificación
 
-PeakGuard cuenta con una suite automatizada de **33 pruebas unitarias y de integración**, incluyendo:
+PeakGuard cuenta con una suite automatizada de **41 pruebas unitarias y de integración en Rust**, más pruebas dinámicas en Node.js para adaptadores:
 - 100% de los casos límite de fixtures JSON (`test-fixtures/schedules/boundary_test_cases.json`).
-- **Prueba E2E del Binario Real (`real_daemon_e2e_tests`):** Levanta el subproceso ejecutable `peakguard run`, valida los puertos TCP reales 8765/8766, verifica consultas de salud, cambio dinámico de modo vía PUT, acuses Stop ACK precisos y apagado ordenado.
-- **Cancelación Activa de Streams SSE (`stream_cancellation_tests`):** Demuestra que el cruce de frontera hacia horario pico corta inmediatamente el flujo en modos de bloqueo y emite un payload de error compatible con OpenAI, impidiendo fugas de tokens, mientras que `notify_only` permite la finalización limpia.
+- **Prueba E2E del Binario Real (`real_daemon_e2e_tests`):** Levanta el subproceso ejecutable `peakguard run` con puertos efímeros dinámicos, reloj simulado (`PEAKGUARD_SIMULATED_TIME`), valida rechazo 401 sin Bearer Token, acuses Stop ACK con `success` obligatorio (422 ante omisión), registro de sesiones activas, filtrado de modelos y apagado ordenado nativo vía `POST /api/v1/control/shutdown`.
+- **Cancelación Activa de Streams SSE (`stream_cancellation_tests`):** Demuestra que el cruce de frontera hacia horario pico corta inmediatamente el flujo mediante temporizador autónomo Tokio (incluso sin llegada de nuevos chunks) y emite un payload de error compatible con OpenAI, impidiendo fugas de tokens, mientras que `notify_only` permite la finalización limpia.
+- **Suite de Adaptadores en Node.js (`adapters/tests/adapter-mock-runner.test.mjs`):** Valida la integración con `client.session.abort()`, acuse de fallo estricto sin falsos positivos y widget TUI.
 - Detección de saltos bruscos en el reloj del sistema operativo (suspensión/reanudación de Windows).
 - Pruebas E2E de gateway con servidor HTTP simulado y streaming concurrente (20 streams simultáneos).
-- Validación de idempotencia y ciclos de deduplicación de alertas.
-- Pruebas completas del servidor MCP y sus salvaguardas de seguridad.
+- Deduplicación de Stop invariante por inicio de ventana pico (`current_peak_window_start`).
+- Pruebas completas del servidor MCP y sus salvaguardas de seguridad de solo lectura.
 
-Para ejecutar todas las pruebas:
+Para ejecutar todas las pruebas de Rust:
 ```powershell
 cd core
 cargo test
+```
+
+Para ejecutar las pruebas de adaptadores en Node.js:
+```powershell
+node adapters/tests/adapter-mock-runner.test.mjs
 ```
 
 Para ejecutar el smoke test de release:
@@ -154,6 +160,9 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 - 🛠️ [Guía de Compilación de Rust](docs/BUILD.md)
 - 📡 [Informe de Viabilidad de OpenCode Go](docs/OPENCODE_GO.md)
 - 🤖 [Manual del Servidor MCP](docs/MCP.md)
+- 🔍 [Auditoría T16.1 de Problemas Pendientes](AUDITORIA_T16_1.md)
+- 🚀 [Informe de Implementación Técnica T17](T17_IMPLEMENTATION_REPORT.md)
+- 📊 [Evidencias Técnicas de Pruebas T17](T17_TEST_EVIDENCE.md)
 - 🗺️ [Backlog Futuro y Roadmap v1.1+](docs/FUTURE_BACKLOG.md)
 - 📋 [Especificación y Plan Maestro Original](PeakGuard_Especificacion_Plan_Maestro.md)
 
