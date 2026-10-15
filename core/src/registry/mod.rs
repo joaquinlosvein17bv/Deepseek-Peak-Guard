@@ -159,3 +159,194 @@ impl ModelRegistry {
         list
     }
 }
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub session_id: String,
+    pub client_type: String, // "opencode", "pi", "hermes"
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(alias = "provider")]
+    pub provider_id: String,
+    pub model: String,
+    #[serde(default)]
+    pub schedule_id: Option<String>,
+    #[serde(default = "default_active")]
+    pub is_active: bool,
+    #[serde(default = "Utc::now")]
+    pub last_heartbeat: DateTime<Utc>,
+}
+
+fn default_active() -> bool {
+    true
+}
+
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: RwLock<HashMap<String, ActiveSession>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, session: ActiveSession) {
+        let mut map = self.sessions.write().unwrap();
+        map.insert(session.session_id.clone(), session);
+    }
+
+    pub fn heartbeat(&self, session_id: &str, turn_id: Option<String>, is_active: Option<bool>) -> bool {
+        let mut map = self.sessions.write().unwrap();
+        if let Some(sess) = map.get_mut(session_id) {
+            sess.last_heartbeat = Utc::now();
+            if let Some(t) = turn_id {
+                sess.turn_id = Some(t);
+            }
+            if let Some(active) = is_active {
+                sess.is_active = active;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn unregister(&self, session_id: &str) {
+        let mut map = self.sessions.write().unwrap();
+        map.remove(session_id);
+    }
+
+    pub fn get_active_sessions_for_schedule(
+        &self,
+        schedule_id: &str,
+        registry: &ModelRegistry,
+    ) -> Vec<ActiveSession> {
+        let map = self.sessions.read().unwrap();
+        map.values()
+            .filter(|s| s.is_active)
+            .filter(|s| {
+                if let Some(provider) = registry.get_provider_for_model(&s.model) {
+                    provider.schedule_id == schedule_id
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn count_active(&self) -> usize {
+        let map = self.sessions.read().unwrap();
+        map.values().filter(|s| s.is_active).count()
+    }
+
+    pub fn prune_stale(&self, timeout: chrono::Duration) {
+        let cutoff = Utc::now() - timeout;
+        let mut map = self.sessions.write().unwrap();
+        map.retain(|_, s| s.last_heartbeat >= cutoff);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_registry_lifecycle() {
+        let registry = SessionRegistry::new();
+        assert_eq!(registry.count_active(), 0);
+
+        // Registrar sesión activa
+        registry.register(ActiveSession {
+            session_id: "s1".to_string(),
+            client_type: "opencode".to_string(),
+            turn_id: Some("t1".to_string()),
+            provider_id: "deepseek_direct".to_string(),
+            model: "deepseek-chat".to_string(),
+            schedule_id: Some("deepseek_direct_verified".to_string()),
+            is_active: true,
+            last_heartbeat: Utc::now(),
+        });
+        assert_eq!(registry.count_active(), 1);
+
+        // Heartbeat
+        let updated = registry.heartbeat("s1", Some("t2".to_string()), Some(true));
+        assert!(updated);
+
+        // Heartbeat para sesión inexistente
+        assert!(!registry.heartbeat("nonexistent", None, None));
+
+        // Desregistrar sesión
+        registry.unregister("s1");
+        assert_eq!(registry.count_active(), 0);
+    }
+
+    #[test]
+    fn test_session_registry_filter_by_schedule() {
+        let session_reg = SessionRegistry::new();
+        let model_reg = ModelRegistry::default();
+
+        session_reg.register(ActiveSession {
+            session_id: "s-deepseek".to_string(),
+            client_type: "opencode".to_string(),
+            turn_id: Some("t1".to_string()),
+            provider_id: "deepseek_direct".to_string(),
+            model: "deepseek-chat".to_string(),
+            schedule_id: None,
+            is_active: true,
+            last_heartbeat: Utc::now(),
+        });
+
+        session_reg.register(ActiveSession {
+            session_id: "s-go".to_string(),
+            client_type: "opencode".to_string(),
+            turn_id: Some("t2".to_string()),
+            provider_id: "opencode_go".to_string(),
+            model: "deepseek-v4.1-flash".to_string(),
+            schedule_id: None,
+            is_active: true,
+            last_heartbeat: Utc::now(),
+        });
+
+        // Filtrar sesiones para deepseek_direct_verified
+        let ds_sessions = session_reg.get_active_sessions_for_schedule("deepseek_direct_verified", &model_reg);
+        assert_eq!(ds_sessions.len(), 1);
+        assert_eq!(ds_sessions[0].session_id, "s-deepseek");
+
+        // Filtrar sesiones para opencode_go_verified
+        let go_sessions = session_reg.get_active_sessions_for_schedule("opencode_go_verified", &model_reg);
+        assert_eq!(go_sessions.len(), 1);
+        assert_eq!(go_sessions[0].session_id, "s-go");
+
+        // Filtrar sesiones para horario inexistente
+        let none_sessions = session_reg.get_active_sessions_for_schedule("nonexistent_sched", &model_reg);
+        assert_eq!(none_sessions.len(), 0);
+    }
+
+    #[test]
+    fn test_session_registry_prune_stale() {
+        let registry = SessionRegistry::new();
+        let old_time = Utc::now() - chrono::Duration::seconds(100);
+
+        registry.register(ActiveSession {
+            session_id: "stale-session".to_string(),
+            client_type: "pi".to_string(),
+            turn_id: None,
+            provider_id: "deepseek_direct".to_string(),
+            model: "deepseek-chat".to_string(),
+            schedule_id: None,
+            is_active: true,
+            last_heartbeat: old_time,
+        });
+
+        // Al podar sesiones más viejas de 30s
+        registry.prune_stale(chrono::Duration::seconds(30));
+        assert_eq!(registry.count_active(), 0);
+    }
+}
+

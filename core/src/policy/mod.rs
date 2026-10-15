@@ -86,6 +86,16 @@ impl PolicyEngine {
         *w = new_mode;
     }
 
+    pub fn get_schedule_for_model(&self, model_name: &str) -> Option<&Schedule> {
+        let provider = self.registry.get_provider_for_model(model_name)?;
+        self.schedules.get(&provider.schedule_id)
+    }
+
+    pub fn time_until_peak_for_model(&self, model_name: &str, time: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+        let schedule = self.get_schedule_for_model(model_name)?;
+        schedule.next_peak(time).map(|(_, s)| s)
+    }
+
     /// Evalúa la política de acceso para una solicitud de inferencia
     pub fn evaluate_request(
         &self,
@@ -133,7 +143,10 @@ impl PolicyEngine {
             OperatingMode::RestrictedStop => {
                 // Si la sesión está identificada y no se ha emitido Stop para esta transición:
                 if let Some(sess) = session_id {
-                    let transition_str = time.format("%Y-%m-%dT%H:%M").to_string();
+                    let transition_str = schedule
+                        .current_peak_window_start(time)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| time.format("%Y-%m-%d").to_string());
                     let key = StopKey {
                         session_id: sess.to_string(),
                         turn_id: turn_id.unwrap_or("default").to_string(),

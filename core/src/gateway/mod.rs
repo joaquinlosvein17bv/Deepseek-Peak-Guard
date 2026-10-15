@@ -1,5 +1,5 @@
 use crate::clock::Clock;
-use crate::policy::{PolicyDecision, PolicyEngine};
+use crate::policy::{OperatingMode, PolicyDecision, PolicyEngine};
 use crate::registry::ModelRegistry;
 use axum::{
     body::Bytes,
@@ -223,42 +223,90 @@ async fn handle_chat_completions(
                 let sess_id = session_id.clone();
 
                 let wrapped_stream = async_stream::stream! {
-                    while let Some(item) = stream_bytes.next().await {
-                        // Comprobar política horaria antes de reenviar cada chunk
-                        let now = clock.now();
-                        let decision = policy_engine.evaluate_request(
-                            &model,
-                            sess_id.as_deref(),
-                            None,
-                            now,
-                            true,
-                        );
+                    let initial_now = clock.now();
+                    let seconds_until_peak = policy_engine.time_until_peak_for_model(&model, initial_now);
 
-                        match decision {
-                            PolicyDecision::Block { reason, .. }
-                            | PolicyDecision::StopRequired { reason, .. } => {
-                                warn!(
-                                    "CANCELACIÓN DE STREAM: Modelo '{}' entró en horario peak durante streaming activo. Cancelando conexión.",
-                                    model
-                                );
-                                if let Some(ref tx) = event_sender {
-                                    let _ = tx.send(format!(
-                                        "{{\"type\":\"stream_cancelled\",\"model\":\"{}\",\"reason\":\"{}\"}}",
-                                        model, reason
-                                    ));
+                    let mut time_deadline = Box::pin(async {
+                        if let Some(secs) = seconds_until_peak {
+                            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                        } else {
+                            futures_util::future::pending::<()>().await;
+                        }
+                    });
+                    let mut peak_deadline_fired = false;
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut time_deadline, if !peak_deadline_fired => {
+                                peak_deadline_fired = true;
+                                // Transición horaria alcanzada en tiempo real independientemente del flujo de bytes
+                                let current_mode = policy_engine.get_mode();
+                                match current_mode {
+                                    OperatingMode::StrictBlock | OperatingMode::RestrictedStop => {
+                                        warn!(
+                                            "CANCELACIÓN TEMPORAL DE STREAM: Modelo '{}' alcanzó la frontera a horario peak (temporizador autónomo). Cortando conexión.",
+                                            model
+                                        );
+                                        if let Some(ref tx) = event_sender {
+                                            let _ = tx.send(format!(
+                                                "{{\"type\":\"stream_cancelled\",\"model\":\"{}\",\"reason\":\"Frontera de horario peak alcanzada (corte temporal autónomo)\"}}",
+                                                model
+                                            ));
+                                        }
+                                        let err_chunk = "data: {\"error\":{\"code\":\"peakguard_stream_cancelled_peak\",\"message\":\"Stream cancelado: inicio de horario peak alcanzado\"}}\n\n";
+                                        yield Ok::<_, std::io::Error>(Bytes::from(err_chunk));
+                                        break;
+                                    }
+                                    OperatingMode::NotifyOnly => {
+                                        info!(
+                                            "STREAM EN HORARIO PEAK: Modelo '{}' en horario peak pero el modo activo es notify_only.",
+                                            model
+                                        );
+                                    }
                                 }
-                                let err_chunk = format!(
-                                    "data: {{\"error\":{{\"code\":\"peakguard_stream_cancelled_peak\",\"message\":\"{}\"}}}}\n\n",
-                                    reason
-                                );
-                                yield Ok::<_, std::io::Error>(Bytes::from(err_chunk));
-                                break;
                             }
-                            PolicyDecision::NotifyOnly { .. } | PolicyDecision::Allow => {
+                            item = stream_bytes.next() => {
                                 match item {
-                                    Ok(b) => yield Ok(b),
-                                    Err(e) => {
+                                    Some(Ok(b)) => {
+                                        let now = clock.now();
+                                        let decision = policy_engine.evaluate_request(
+                                            &model,
+                                            sess_id.as_deref(),
+                                            None,
+                                            now,
+                                            true,
+                                        );
+
+                                        match decision {
+                                            PolicyDecision::Block { reason, .. }
+                                            | PolicyDecision::StopRequired { reason, .. } => {
+                                                warn!(
+                                                    "CANCELACIÓN DE STREAM (por chunk): Modelo '{}' en horario peak. Cancelando conexión.",
+                                                    model
+                                                );
+                                                if let Some(ref tx) = event_sender {
+                                                    let _ = tx.send(format!(
+                                                        "{{\"type\":\"stream_cancelled\",\"model\":\"{}\",\"reason\":\"{}\"}}",
+                                                        model, reason
+                                                    ));
+                                                }
+                                                let err_chunk = format!(
+                                                    "data: {{\"error\":{{\"code\":\"peakguard_stream_cancelled_peak\",\"message\":\"{}\"}}}}\n\n",
+                                                    reason
+                                                );
+                                                yield Ok::<_, std::io::Error>(Bytes::from(err_chunk));
+                                                break;
+                                            }
+                                            PolicyDecision::NotifyOnly { .. } | PolicyDecision::Allow => {
+                                                yield Ok::<_, std::io::Error>(b);
+                                            }
+                                        }
+                                    }
+                                    Some(Err(e)) => {
                                         yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                                        break;
+                                    }
+                                    None => {
                                         break;
                                     }
                                 }

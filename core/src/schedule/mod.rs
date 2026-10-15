@@ -115,6 +115,22 @@ impl Schedule {
         self.intervals.iter().any(|inv| inv.contains(current_time))
     }
 
+    /// Obtiene el inicio exacto de la ventana peak actual (si el timestamp está en peak)
+    pub fn current_peak_window_start(&self, time: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.is_peak(time) {
+            return None;
+        }
+        let date = time.date_naive();
+        let current_time = time.time();
+        for inv in &self.intervals {
+            if inv.contains(current_time) {
+                let start_dt = date.and_time(inv.start);
+                return Some(DateTime::from_naive_utc_and_offset(start_dt, Utc));
+            }
+        }
+        None
+    }
+
     /// Obtiene el inicio del próximo intervalo peak y los segundos restantes
     pub fn next_peak(&self, time: DateTime<Utc>) -> Option<(DateTime<Utc>, u64)> {
         if self.is_peak(time) {

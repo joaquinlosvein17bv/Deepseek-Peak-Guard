@@ -138,3 +138,29 @@ fn test_runtime_mode_switch() {
     let d2 = engine.evaluate_request("deepseek-chat", None, None, t, true);
     assert!(matches!(d2, PolicyDecision::Block { .. }));
 }
+
+#[test]
+fn test_stop_deduplication_across_minutes_in_same_window() {
+    let engine = setup_test_engine(OperatingMode::RestrictedStop);
+    
+    // T17.5: A las 02:01 UTC (dentro de la ventana 01:00-04:00)
+    let t1 = DateTime::parse_from_rfc3339("2026-10-19T02:01:00Z").unwrap().with_timezone(&Utc);
+    let d1 = engine.evaluate_request("deepseek-chat", Some("session-x"), Some("turn-1"), t1, true);
+    assert!(matches!(d1, PolicyDecision::StopRequired { .. }));
+
+    // A las 02:05 UTC (4 minutos después, misma ventana pico y mismo turno):
+    // La clave deduplicada basada en el inicio invariante de la ventana (01:00:00Z)
+    // impide enviar un nuevo Stop innecesario cada minuto.
+    let t2 = DateTime::parse_from_rfc3339("2026-10-19T02:05:00Z").unwrap().with_timezone(&Utc);
+    let d2 = engine.evaluate_request("deepseek-chat", Some("session-x"), Some("turn-1"), t2, true);
+    assert!(matches!(d2, PolicyDecision::Block { .. }));
+
+    // Un nuevo turno iniciado dentro de la misma ventana puede recibir su propio Stop ordenado
+    let d3 = engine.evaluate_request("deepseek-chat", Some("session-x"), Some("turn-2"), t2, true);
+    assert!(matches!(d3, PolicyDecision::StopRequired { .. }));
+
+    // En la siguiente ventana pico (06:00-10:00), a las 06:10 UTC:
+    let t3 = DateTime::parse_from_rfc3339("2026-10-19T06:10:00Z").unwrap().with_timezone(&Utc);
+    let d4 = engine.evaluate_request("deepseek-chat", Some("session-x"), Some("turn-1"), t3, true);
+    assert!(matches!(d4, PolicyDecision::StopRequired { .. }));
+}

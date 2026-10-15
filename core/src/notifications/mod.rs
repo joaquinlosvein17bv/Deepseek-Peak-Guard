@@ -38,6 +38,11 @@ impl NotificationEngine {
         }
     }
 
+    /// Comprueba si una alerta ya fue emitida sin registrarla
+    pub fn is_seen(&self, key: &DeduplicationKey) -> bool {
+        self.seen_alerts.read().unwrap().contains(key)
+    }
+
     /// Comprueba y registra si la alerta ya fue emitida para evitar spam o duplicados
     pub fn should_emit(&self, key: &DeduplicationKey) -> bool {
         let mut seen = self.seen_alerts.write().unwrap();

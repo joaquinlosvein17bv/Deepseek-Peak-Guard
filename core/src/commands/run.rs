@@ -1,10 +1,10 @@
-use crate::clock::{Clock, SystemClock};
+use crate::clock::{Clock, SystemClock, TestClock};
 use crate::config::Config;
 use crate::control_api::{self, ControlApiState};
 use crate::gateway::{self, GatewayState};
 use crate::notifications::{DeduplicationKey, NotificationEngine};
 use crate::policy::{OperatingMode, PolicyEngine};
-use crate::registry::ModelRegistry;
+use crate::registry::{ModelRegistry, SessionRegistry};
 use crate::schedule::{chinese_public_holidays_2026, Schedule};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -38,14 +38,17 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
     }
     let reg_arc = Arc::new(registry);
 
-    // 2. Configurar Schedules
+    // 2. Configurar Schedules (incorporando festivos configurables de cualquier año)
     let mut schedules = HashMap::new();
     for s in &cfg.schedules {
-        let holidays = if s.exclude_chinese_public_holidays {
-            chinese_public_holidays_2026()
-        } else {
-            vec![]
-        };
+        let mut holidays = s.holidays.clone();
+        if s.exclude_chinese_public_holidays {
+            for h in chinese_public_holidays_2026() {
+                if !holidays.contains(&h) {
+                    holidays.push(h);
+                }
+            }
+        }
         let sched = Schedule::new(
             &s.id,
             &s.intervals,
@@ -67,9 +70,23 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
         schedules.clone(),
     ));
 
-    // 4. Canal de eventos Server-Sent Events (SSE)
+    // 4. Canal de eventos SSE y registro central de sesiones
     let (event_tx, _) = broadcast::channel::<String>(256);
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let session_registry = Arc::new(SessionRegistry::new());
+
+    // Soporte para reloj simulado determinista en pruebas E2E (vía PEAKGUARD_SIMULATED_TIME)
+    let (clock, test_clock_opt): (Arc<dyn Clock>, Option<TestClock>) =
+        if let Ok(sim_str) = std::env::var("PEAKGUARD_SIMULATED_TIME") {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&sim_str) {
+                let tc = TestClock::new(dt.with_timezone(&chrono::Utc));
+                info!("MODO DE PRUEBA ACTIVADO: Usando reloj simulado en {}", sim_str);
+                (Arc::new(tc.clone()), Some(tc))
+            } else {
+                (Arc::new(SystemClock), None)
+            }
+        } else {
+            (Arc::new(SystemClock), None)
+        };
 
     // 5. Vincular listeners de Gateway y Control API
     let gw_addr: SocketAddr = format!(
@@ -112,7 +129,15 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
         }
     };
 
-    // 6. Construir routers de Axum
+    // 6. Autenticación y Construcción de routers de Axum
+    let auth_token = Arc::new(control_api::resolve_or_create_control_token(&cfg.control.token_env));
+    info!(
+        "Control API inicializada con autenticación Bearer Token (token_env='{}')",
+        cfg.control.token_env
+    );
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     let gateway_state = GatewayState {
         policy_engine: policy_engine.clone(),
         registry: reg_arc.clone(),
@@ -126,8 +151,11 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
         policy_engine: policy_engine.clone(),
         registry: reg_arc.clone(),
         schedules: Arc::new(schedules.clone()),
+        session_registry: session_registry.clone(),
         event_tx: event_tx.clone(),
         clock: clock.clone(),
+        auth_token: auth_token.clone(),
+        shutdown_tx: Some(shutdown_tx),
     };
     let control_router = control_api::create_control_router(control_state);
 
@@ -148,24 +176,38 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
     let ticker_schedules = schedules.clone();
     let ticker_event_tx = event_tx.clone();
     let ticker_notifier = notifier.clone();
+    let ticker_session_reg = session_registry.clone();
+    let ticker_registry = reg_arc.clone();
+    let ticker_policy_engine = policy_engine.clone();
     let telegram_enabled = cfg.alerts.telegram;
     let notify_peak_end = cfg.alerts.notify_on_peak_end;
 
     let monitor_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut was_peak = false;
+        let mut schedule_peak_states: HashMap<String, bool> = HashMap::new();
 
         loop {
             interval.tick().await;
+            if let Some(ref tc) = test_clock_opt {
+                tc.advance(chrono::Duration::seconds(1));
+            }
             let now = ticker_clock.now();
+
+            // Purgar sesiones inactivas (más de 60s sin heartbeat)
+            ticker_session_reg.prune_stale(chrono::Duration::seconds(60));
 
             for (sched_id, schedule) in &ticker_schedules {
                 let is_peak = schedule.is_peak(now);
+                let was_peak = schedule_peak_states.entry(sched_id.clone()).or_insert(false);
 
                 // Detección de transición a Peak
-                if is_peak && !was_peak {
-                    was_peak = true;
-                    let transition_str = now.to_rfc3339();
+                if is_peak && !*was_peak {
+                    *was_peak = true;
+                    let transition_str = schedule
+                        .current_peak_window_start(now)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| now.to_rfc3339());
+
                     info!(
                         "TRANSICIÓN: Inicio de horario peak detectado para '{}' a las {}",
                         sched_id, transition_str
@@ -175,10 +217,29 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
                         sched_id, transition_str
                     ));
 
+                    // En modo RestrictedStop: Enviar stop_requested a los turnos activos de este horario
+                    if ticker_policy_engine.get_mode() == OperatingMode::RestrictedStop {
+                        let active_sessions = ticker_session_reg.get_active_sessions_for_schedule(sched_id, &ticker_registry);
+                        for sess in active_sessions {
+                            info!(
+                                "EMITIENDO STOP NATIVO: Sesión activa '{}' (cliente '{}', modelo '{}') detenida por inicio de horario peak.",
+                                sess.session_id, sess.client_type, sess.model
+                            );
+                            let _ = ticker_event_tx.send(format!(
+                                "{{\"type\":\"stop_requested\",\"session_id\":\"{}\",\"turn_id\":{},\"provider_id\":\"{}\",\"model\":\"{}\",\"transition_utc\":\"{}\",\"reason\":\"Horario peak iniciado. Cancelando turno activo mediante Stop nativo sin cerrar aplicación.\"}}",
+                                sess.session_id,
+                                sess.turn_id.as_ref().map(|t| format!("\"{}\"", t)).unwrap_or_else(|| "null".to_string()),
+                                sess.provider_id,
+                                sess.model,
+                                transition_str
+                            ));
+                        }
+                    }
+
                     if telegram_enabled {
                         let key = DeduplicationKey {
                             schedule_id: sched_id.clone(),
-                            window_start_utc: transition_str,
+                            window_start_utc: transition_str.clone(),
                             threshold: "peak_active".to_string(),
                             channel: "telegram".to_string(),
                         };
@@ -189,9 +250,9 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
                             )
                             .await;
                     }
-                } else if !is_peak && was_peak {
+                } else if !is_peak && *was_peak {
                     // Detección de fin de Peak
-                    was_peak = false;
+                    *was_peak = false;
                     let transition_str = now.to_rfc3339();
                     info!(
                         "TRANSICIÓN: Fin de horario peak para '{}' a las {}",
@@ -229,47 +290,102 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
                         ));
                     }
 
-                    if seconds_left == 1800 {
-                        // T-30 min
-                        let _ = ticker_event_tx.send(format!(
-                            "{{\"type\":\"warning_30\",\"schedule_id\":\"{}\",\"seconds_left\":1800}}",
-                            sched_id
-                        ));
-                        if telegram_enabled {
-                            let key = DeduplicationKey {
-                                schedule_id: sched_id.clone(),
-                                window_start_utc: window_start,
-                                threshold: "warning_30".to_string(),
-                                channel: "telegram".to_string(),
-                            };
-                            ticker_notifier
-                                .notify_telegram(
-                                    &key,
-                                    &format!("⚠️ <b>PeakGuard:</b> Faltan 30 minutos para el horario Peak ({})", sched_id),
-                                )
-                                .await;
+                    // T-30 min: rango [1200, 1800] s
+                    if seconds_left <= 1800 && seconds_left > 1200 {
+                        let key = DeduplicationKey {
+                            schedule_id: sched_id.clone(),
+                            window_start_utc: window_start.clone(),
+                            threshold: "warning_30".to_string(),
+                            channel: "internal".to_string(),
+                        };
+                        if ticker_notifier.should_emit(&key) {
+                            info!("Emitiendo alerta T-30 min para '{}' ({}s restantes)", sched_id, seconds_left);
+                            let _ = ticker_event_tx.send(format!(
+                                "{{\"type\":\"warning_30\",\"schedule_id\":\"{}\",\"seconds_left\":{}}}",
+                                sched_id, seconds_left
+                            ));
+                            if telegram_enabled {
+                                let tg_key = DeduplicationKey {
+                                    schedule_id: sched_id.clone(),
+                                    window_start_utc: window_start.clone(),
+                                    threshold: "warning_30".to_string(),
+                                    channel: "telegram".to_string(),
+                                };
+                                ticker_notifier
+                                    .notify_telegram(
+                                        &tg_key,
+                                        &format!("⚠️ <b>PeakGuard:</b> Faltan ~30 minutos para el horario Peak ({})", sched_id),
+                                    )
+                                    .await;
+                            }
                         }
-                    } else if seconds_left == 600 {
-                        // T-10 min
-                        let _ = ticker_event_tx.send(format!(
-                            "{{\"type\":\"warning_10\",\"schedule_id\":\"{}\",\"seconds_left\":600}}",
-                            sched_id
-                        ));
-                    } else if seconds_left == 300 {
-                        // T-5 min
-                        let _ = ticker_event_tx.send(format!(
-                            "{{\"type\":\"warning_5\",\"schedule_id\":\"{}\",\"seconds_left\":300}}",
-                            sched_id
-                        ));
+                    } else if seconds_left <= 600 && seconds_left > 350 {
+                        // T-10 min: rango [350, 600] s
+                        let key = DeduplicationKey {
+                            schedule_id: sched_id.clone(),
+                            window_start_utc: window_start.clone(),
+                            threshold: "warning_10".to_string(),
+                            channel: "internal".to_string(),
+                        };
+                        if ticker_notifier.should_emit(&key) {
+                            info!("Emitiendo alerta T-10 min para '{}' ({}s restantes)", sched_id, seconds_left);
+                            let _ = ticker_event_tx.send(format!(
+                                "{{\"type\":\"warning_10\",\"schedule_id\":\"{}\",\"seconds_left\":{}}}",
+                                sched_id, seconds_left
+                            ));
+                            if telegram_enabled {
+                                let tg_key = DeduplicationKey {
+                                    schedule_id: sched_id.clone(),
+                                    window_start_utc: window_start.clone(),
+                                    threshold: "warning_10".to_string(),
+                                    channel: "telegram".to_string(),
+                                };
+                                ticker_notifier
+                                    .notify_telegram(
+                                        &tg_key,
+                                        &format!("⚠️ <b>PeakGuard:</b> Faltan ~10 minutos para el horario Peak ({})", sched_id),
+                                    )
+                                    .await;
+                            }
+                        }
+                    } else if seconds_left <= 300 && seconds_left > 10 {
+                        // T-5 min: rango [10, 300] s
+                        let key = DeduplicationKey {
+                            schedule_id: sched_id.clone(),
+                            window_start_utc: window_start.clone(),
+                            threshold: "warning_5".to_string(),
+                            channel: "internal".to_string(),
+                        };
+                        if ticker_notifier.should_emit(&key) {
+                            info!("Emitiendo alerta T-5 min para '{}' ({}s restantes)", sched_id, seconds_left);
+                            let _ = ticker_event_tx.send(format!(
+                                "{{\"type\":\"warning_5\",\"schedule_id\":\"{}\",\"seconds_left\":{}}}",
+                                sched_id, seconds_left
+                            ));
+                            if telegram_enabled {
+                                let tg_key = DeduplicationKey {
+                                    schedule_id: sched_id.clone(),
+                                    window_start_utc: window_start.clone(),
+                                    threshold: "warning_5".to_string(),
+                                    channel: "telegram".to_string(),
+                                };
+                                ticker_notifier
+                                    .notify_telegram(
+                                        &tg_key,
+                                        &format!("⚠️ <b>PeakGuard:</b> Faltan ~5 minutos para el horario Peak ({})", sched_id),
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             }
         }
     });
 
-    info!("PeakGuard está en ejecución activa. Presione Ctrl+C para detener.");
+    info!("PeakGuard está en ejecución activa. Presione Ctrl+C o envíe shutdown para detener.");
 
-    // 8. Servir en paralelo ambos puertos con apagado ordenado mediante Ctrl+C
+    // 8. Servir en paralelo ambos puertos con apagado ordenado mediante Ctrl+C o shutdown HTTP
     tokio::select! {
         res = axum::serve(gw_listener, gateway_router) => {
             if let Err(e) = res {
@@ -283,6 +399,9 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Señal de terminación recibida (Ctrl+C). Iniciando apagado ordenado...");
+        }
+        _ = shutdown_rx.recv() => {
+            info!("Orden de apagado recibida vía Control API. Iniciando apagado ordenado...");
         }
     }
 

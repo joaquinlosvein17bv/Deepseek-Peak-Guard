@@ -45,9 +45,14 @@ pub fn execute<P: AsRef<Path>>(config_path: Option<P>) {
 
     // 4. Clientes Detectados
     println!("[4/5] Detección de Clientes:");
-    check_client("OpenCode", r"C:\Users\meliodaslosven\.config\opencode");
-    check_client("Pi Coding Agent", r"C:\Users\meliodaslosven\.pi\agent");
-    check_client("Hermes Agent", r"C:\Users\meliodaslosven\AppData\Local\hermes");
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".to_string());
+    let opencode_path = format!(r"{}\.config\opencode", home);
+    let pi_path = format!(r"{}\.pi\agent", home);
+    let hermes_path = format!(r"{}\AppData\Local\hermes", home);
+
+    check_client("OpenCode", &opencode_path);
+    check_client("Pi Coding Agent", &pi_path);
+    check_client("Hermes Agent", &hermes_path);
 
     // 5. Cobertura Resumida
     println!("[5/5] Diagnóstico de Cobertura:");

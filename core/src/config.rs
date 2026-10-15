@@ -226,6 +226,8 @@ pub struct ScheduleConfig {
     #[serde(default)]
     pub exclude_chinese_public_holidays: bool,
     #[serde(default)]
+    pub holidays: Vec<String>,
+    #[serde(default)]
     pub source_url: Option<String>,
 }
 
@@ -261,6 +263,7 @@ impl Default for Config {
                 ],
                 intervals: vec!["01:00-04:00".to_string(), "06:00-10:00".to_string()],
                 exclude_chinese_public_holidays: true,
+                holidays: vec![],
                 source_url: Some("https://api-docs.deepseek.com/quick_start/pricing/".to_string()),
             }],
         }
