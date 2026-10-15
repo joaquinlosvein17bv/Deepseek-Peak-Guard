@@ -89,10 +89,20 @@ export async function sendControlRequest(endpoint, method = "GET", body = null) 
   });
 }
 
+export const activeSessions = new Map();
+const processedStopKeys = new Set();
+
 /**
  * Registra una sesión activa en el daemon
  */
 export async function registerActiveSession(sessionID, model = "deepseek-chat", provider = "deepseek_direct", turnID = null) {
+  activeSessions.set(sessionID, {
+    model,
+    provider,
+    turnID,
+    isActive: true,
+  });
+
   return sendControlRequest("/api/v1/sessions/register", "POST", {
     session_id: sessionID,
     client_type: "opencode",
@@ -107,6 +117,11 @@ export async function registerActiveSession(sessionID, model = "deepseek-chat", 
  * Envía latido (heartbeat) de la sesión activa
  */
 export async function sendSessionHeartbeat(sessionID, turnID = null, isActive = true) {
+  const existing = activeSessions.get(sessionID) || {};
+  existing.turnID = turnID;
+  existing.isActive = isActive;
+  activeSessions.set(sessionID, existing);
+
   return sendControlRequest("/api/v1/sessions/heartbeat", "POST", {
     session_id: sessionID,
     turn_id: turnID,
@@ -118,6 +133,8 @@ export async function sendSessionHeartbeat(sessionID, turnID = null, isActive = 
  * Desregistra una sesión al cerrarse
  */
 export async function unregisterSession(sessionID) {
+  activeSessions.delete(sessionID);
+
   return sendControlRequest("/api/v1/sessions/unregister", "POST", {
     session_id: sessionID,
   });
@@ -142,20 +159,35 @@ export async function sendStopAck(sessionID, transitionUtc, success, error = nul
  */
 export function startEventSubscriber(client) {
   const token = getAuthToken();
-  const queryParam = token ? `?token=${encodeURIComponent(token)}` : "";
   const headers = {};
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const url = `${PEAKGUARD_CONTROL_URL}/api/v1/events${queryParam}`;
+  // Token en cabecera Authorization Bearer exclusivamente (sin query param en URL)
+  const url = `${PEAKGUARD_CONTROL_URL}/api/v1/events`;
+
+  let reconnectAttempts = 0;
+  let reconnectTimer = null;
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      startEventSubscriber(client);
+    }, delay);
+  }
 
   const req = http.get(url, { headers }, (res) => {
     if (res.statusCode !== 200) {
-      console.warn(`[PeakGuard:OpenCode] SSE rechazado por Control API (Status ${res.statusCode}). Reintentando...`);
-      setTimeout(() => startEventSubscriber(client), 5000);
+      console.warn(`[PeakGuard:OpenCode] SSE rechazado por Control API (Status ${res.statusCode}). Reintentando con backoff...`);
+      scheduleReconnect();
       return;
     }
+
+    reconnectAttempts = 0;
 
     let buffer = "";
     res.on("data", async (chunk) => {
@@ -170,6 +202,22 @@ export function startEventSubscriber(client) {
             if (event.type === "stop_requested" && event.session_id) {
               const sessionID = event.session_id;
               const turnID = event.turn_id || null;
+
+              // Si se tienen sesiones registradas en este cliente y la solicitada no pertenece, ignorar
+              if (activeSessions.size > 0 && !activeSessions.has(sessionID)) {
+                console.info(
+                  `[PeakGuard:OpenCode] Sesión '${sessionID}' no pertenece a este cliente OpenCode. Ignorando orden.`
+                );
+                return;
+              }
+
+              // Deduplicar órdenes de Stop repetidas
+              const stopKey = `${sessionID}:${turnID || ""}:${event.transition_utc || ""}`;
+              if (processedStopKeys.has(stopKey)) {
+                return;
+              }
+              processedStopKeys.add(stopKey);
+
               console.warn(
                 `[PeakGuard:OpenCode] Recibida orden de Stop nativo para sesión '${sessionID}'. Abortando turno activo...`
               );
@@ -208,12 +256,12 @@ export function startEventSubscriber(client) {
     });
 
     res.on("end", () => {
-      setTimeout(() => startEventSubscriber(client), 3000);
+      scheduleReconnect();
     });
   });
 
   req.on("error", () => {
-    setTimeout(() => startEventSubscriber(client), 5000);
+    scheduleReconnect();
   });
 
   return req;
@@ -239,6 +287,10 @@ export const PeakGuardServerPlugin = async (input) => {
 
       if (type === "message.created" && sessionID) {
         await sendSessionHeartbeat(sessionID, properties?.messageId, true);
+      }
+
+      if ((type === "message.completed" || type === "session.idle") && sessionID) {
+        await sendSessionHeartbeat(sessionID, properties?.messageId, false);
       }
 
       if (type === "session.deleted" && sessionID) {

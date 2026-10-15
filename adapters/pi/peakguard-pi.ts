@@ -128,20 +128,26 @@ export default function peakguardExtension(pi: any) {
   let activeCtx: any = null;
   let activeSessionId: string = "pi-default-session";
   let activeTurnId: string | null = null;
+  let currentModel = "deepseek-chat";
   let isPeakActive = false;
   let sseReq: http.ClientRequest | null = null;
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  let reconnectAttempts = 0;
+  const processedStopKeys = new Set<string>();
 
   // 1. Mantener referencia al contexto de sesión y turno activo
   if (typeof pi?.on === "function") {
     pi.on("session_start", (_event: any, ctx: any) => {
       activeCtx = ctx;
       activeSessionId = ctx?.sessionId || ctx?.id || "pi-session";
+      if (ctx?.model) currentModel = ctx.model;
       updateStatusDisplay();
     });
 
     pi.on("agent_start", (_event: any, ctx: any) => {
       activeCtx = ctx;
       activeSessionId = ctx?.sessionId || ctx?.id || activeSessionId;
+      if (ctx?.model) currentModel = ctx.model;
       updateStatusDisplay();
     });
 
@@ -149,12 +155,20 @@ export default function peakguardExtension(pi: any) {
       activeCtx = ctx;
       activeTurnId = ctx?.turnId || ctx?.id || `turn-${Date.now()}`;
       activeSessionId = ctx?.sessionId || ctx?.id || activeSessionId;
-      const model = ctx?.model || "deepseek-chat";
-      await registerActiveSession(activeSessionId, activeTurnId, model);
+      const model = ctx?.model || currentModel;
+      if (model !== currentModel) {
+        currentModel = model;
+      }
+      await registerActiveSession(activeSessionId, activeTurnId, currentModel);
     });
 
     pi.on("agent_settled", async (_event: any, ctx: any) => {
-      if (activeCtx === ctx) {
+      if (activeCtx === ctx || !ctx) {
+        await sendControlRequest("/api/v1/sessions/heartbeat", "POST", {
+          session_id: activeSessionId,
+          turn_id: activeTurnId,
+          is_active: false,
+        });
         activeTurnId = null;
       }
     });
@@ -185,20 +199,32 @@ export default function peakguardExtension(pi: any) {
   updateStatusDisplay();
   const pollInterval = setInterval(updateStatusDisplay, 15000);
 
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectEvents();
+    }, delay);
+  }
+
   // 3. Conectar a eventos SSE del Control API de PeakGuard
   function connectEvents() {
     const token = getAuthToken();
-    const query = token ? `?token=${encodeURIComponent(token)}` : "";
     const headers: Record<string, string> = {};
     if (token) headers["Authorization"] = `Bearer ${token}`;
 
-    const url = `${PEAKGUARD_CONTROL_URL}/api/v1/events${query}`;
+    // Token solo en Authorization header, nunca en URL
+    const url = `${PEAKGUARD_CONTROL_URL}/api/v1/events`;
 
     sseReq = http.get(url, { headers }, (res) => {
       if (res.statusCode !== 200) {
-        setTimeout(connectEvents, 5000);
+        scheduleReconnect();
         return;
       }
+
+      reconnectAttempts = 0;
 
       let buffer = "";
       res.on("data", async (chunk) => {
@@ -212,6 +238,24 @@ export default function peakguardExtension(pi: any) {
               const event = JSON.parse(line.slice(6));
               if (event.type === "stop_requested") {
                 const targetSession = event.session_id;
+
+                // Validación estricta de identidad de sesión: ignorar órdenes para otras sesiones
+                if (!targetSession || targetSession !== activeSessionId) {
+                  return;
+                }
+
+                // Si se especifica turn_id y se conoce el turno activo, validar correspondencia
+                if (event.turn_id && activeTurnId && event.turn_id !== activeTurnId) {
+                  return;
+                }
+
+                // Deduplicar órdenes de Stop repetidas
+                const stopKey = `${targetSession}:${event.turn_id || ""}:${event.transition_utc || ""}`;
+                if (processedStopKeys.has(stopKey)) {
+                  return;
+                }
+                processedStopKeys.add(stopKey);
+
                 console.warn(
                   `[PeakGuard:Pi] Orden de Stop recibida para '${targetSession}'. Abortando turno activo...`
                 );
@@ -261,12 +305,12 @@ export default function peakguardExtension(pi: any) {
       });
 
       res.on("end", () => {
-        setTimeout(connectEvents, 3000);
+        scheduleReconnect();
       });
     });
 
     sseReq.on("error", () => {
-      setTimeout(connectEvents, 5000);
+      scheduleReconnect();
     });
   }
 
@@ -274,6 +318,7 @@ export default function peakguardExtension(pi: any) {
 
   return () => {
     clearInterval(pollInterval);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
     if (sseReq) sseReq.destroy();
   };
 }

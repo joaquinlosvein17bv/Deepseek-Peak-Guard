@@ -12,15 +12,15 @@ const TEST_TOKEN = "mock-secret-token-xyz";
 let receivedAcks = [];
 let registeredSessions = [];
 let unregisterCalls = [];
+let heartbeatCalls = [];
 let sseSubscribers = [];
 
 const server = http.createServer((req, res) => {
   const authHeader = req.headers["authorization"];
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const queryToken = url.searchParams.get("token");
 
-  // Validar autenticación
-  const isAuthorized = authHeader === `Bearer ${TEST_TOKEN}` || queryToken === TEST_TOKEN;
+  // En T18 la autenticación requiere estricto Bearer Token en headers (sin query param en URL)
+  const isAuthorized = authHeader === `Bearer ${TEST_TOKEN}`;
 
   if (url.pathname === "/api/v1/status") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -49,6 +49,18 @@ const server = http.createServer((req, res) => {
       registeredSessions.push(parsed);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "registered" }));
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/v1/sessions/heartbeat" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      const parsed = JSON.parse(body);
+      heartbeatCalls.push(parsed);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "heartbeat_received" }));
     });
     return;
   }
@@ -102,13 +114,13 @@ server.listen(0, "127.0.0.1", async () => {
   try {
     // Importar adaptadores dinámicamente con las variables de entorno configuradas
     const {
-      PeakGuardServerPlugin,
       registerActiveSession,
       sendStopAck,
       startEventSubscriber,
     } = await import("../opencode/peakguard-opencode-server.js");
 
     const { fetchStatus } = await import("../opencode/peakguard-tui-sidebar.js");
+    const { default: peakguardPiExtension } = await import("../pi/peakguard-pi.ts");
 
     console.log("--- 1. Probando fetchStatus() en Widget TUI ---");
     const status = await fetchStatus();
@@ -116,7 +128,7 @@ server.listen(0, "127.0.0.1", async () => {
     assert.strictEqual(status.mode, "restricted_stop");
     console.log("  ✓ Widget TUI sincronizó estado correctamente.");
 
-    console.log("--- 2. Probando registro de sesiones activas (T17.2) ---");
+    console.log("--- 2. Probando registro de sesiones activas (T17.2, T18.4) ---");
     const regRes = await registerActiveSession("session-test-1", "deepseek-chat", "deepseek_direct", "turn-1");
     assert.strictEqual(regRes.statusCode, 200);
     assert.strictEqual(registeredSessions.length, 1);
@@ -169,6 +181,8 @@ server.listen(0, "127.0.0.1", async () => {
     receivedAcks = [];
 
     console.log("--- 4. Probando Stop con fallo: NUNCA reportar falso positivo (T17.1, T17.6) ---");
+    await registerActiveSession("session-failing-1", "deepseek-chat", "deepseek_direct", "turn-fail");
+
     const failingClient = {
       session: {
         abort: async () => {
@@ -198,8 +212,117 @@ server.listen(0, "127.0.0.1", async () => {
     assert.ok(failAck.error.includes("Simulated editor crash"), "Error reportado debe contener el mensaje real");
     console.log("  ✓ Fallo de abort reporta estrictamente success=false sin falsos positivos.");
 
-    sseReq.destroy();
     sseReq2.destroy();
+    sseSubscribers = [];
+    receivedAcks = [];
+
+    console.log("--- 5. Probando aislamiento de sesión en OpenCode (ignora sesiones ajenas) ---");
+    let foreignAbortCalled = false;
+    const isolationClient = {
+      session: {
+        abort: async () => {
+          foreignAbortCalled = true;
+          return { aborted: true };
+        },
+      },
+    };
+
+    const sseReq3 = startEventSubscriber(isolationClient);
+    await new Promise((r) => setTimeout(r, 200));
+
+    for (const sub of sseSubscribers) {
+      sub.write(
+        `data: ${JSON.stringify({
+          type: "stop_requested",
+          session_id: "session-foreign-unknown-999",
+          transition_utc: "2026-10-15T01:00:00Z",
+        })}\n\n`
+      );
+    }
+
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(foreignAbortCalled, false, "No debe abortar sesiones que no pertenecen a este cliente");
+    console.log("  ✓ OpenCode ignora Stop de sesiones ajenas no registradas en su contexto.");
+
+    sseReq3.destroy();
+    sseSubscribers = [];
+    receivedAcks = [];
+
+    console.log("--- 6. Probando adaptador de Pi: aislamiento de sesión, abort nativo y settled ---");
+    let piAbortCalled = false;
+    let piEventListeners = {};
+
+    const mockPi = {
+      on: (evt, cb) => {
+        piEventListeners[evt] = cb;
+      },
+      abort: () => {
+        piAbortCalled = true;
+      },
+    };
+
+    const cleanupPi = peakguardPiExtension(mockPi);
+
+    const mockPiCtx = {
+      sessionId: "pi-isolated-session",
+      turnId: "turn-pi-1",
+      model: "deepseek-reasoner",
+      abort: () => {
+        piAbortCalled = true;
+      },
+    };
+
+    await piEventListeners["session_start"]?.({}, mockPiCtx);
+    await piEventListeners["turn_start"]?.({}, mockPiCtx);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    // A. Emitir stop para sesión ajena
+    console.log("  Enviando stop_requested para 'opencode-foreign-session-888'...");
+    for (const sub of sseSubscribers) {
+      sub.write(
+        `data: ${JSON.stringify({
+          type: "stop_requested",
+          session_id: "opencode-foreign-session-888",
+          transition_utc: "2026-10-15T01:00:00Z",
+        })}\n\n`
+      );
+    }
+
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(piAbortCalled, false, "Pi no debe abortar si el stop_requested es para otra sesión");
+    console.log("  ✓ Pi ignoró exitosamente el stop para sesión ajena.");
+
+    // B. Emitir stop para la sesión activa de Pi
+    console.log("  Enviando stop_requested para la sesión propia 'pi-isolated-session'...");
+    for (const sub of sseSubscribers) {
+      sub.write(
+        `data: ${JSON.stringify({
+          type: "stop_requested",
+          session_id: "pi-isolated-session",
+          turn_id: "turn-pi-1",
+          transition_utc: "2026-10-15T01:00:00Z",
+        })}\n\n`
+      );
+    }
+
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(piAbortCalled, true, "Pi debe abortar su sesión propia");
+    const piAck = receivedAcks.find((a) => a.session_id === "pi-isolated-session");
+    assert.ok(piAck, "Pi debe enviar Stop ACK");
+    assert.strictEqual(piAck.success, true, "Pi debe reportar éxito de abort");
+    console.log("  ✓ Pi ejecutó abort() nativo y envió Stop ACK confirmado.");
+
+    // C. Probar agent_settled emitiendo is_active: false
+    await piEventListeners["agent_settled"]?.({}, mockPiCtx);
+    await new Promise((r) => setTimeout(r, 100));
+    const settledHeartbeat = heartbeatCalls.find(
+      (h) => h.session_id === "pi-isolated-session" && h.is_active === false
+    );
+    assert.ok(settledHeartbeat, "agent_settled debe enviar heartbeat con is_active: false");
+    console.log("  ✓ Pi envió is_active: false en agent_settled.");
+
+    cleanupPi();
     server.close();
     console.log("\n=========================================");
     console.log("TODAS LAS PRUEBAS DE MOCK RUNNER PASARON!");
