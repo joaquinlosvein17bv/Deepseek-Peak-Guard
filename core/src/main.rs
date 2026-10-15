@@ -15,7 +15,7 @@ use std::path::PathBuf;
     version
 )]
 struct Cli {
-    #[arg(short, long, value_name = "FILE", help = "Ruta al archivo peakguard.toml")]
+    #[arg(short, long, global = true, value_name = "FILE", help = "Ruta al archivo peakguard.toml")]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
