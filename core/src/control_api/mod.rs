@@ -2,7 +2,7 @@ use crate::policy::{OperatingMode, PolicyEngine, StopKey};
 use crate::registry::ModelRegistry;
 use crate::schedule::Schedule;
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::StatusCode,
     response::sse::{Event, Sse},
     routing::{get, post, put},
