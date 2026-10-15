@@ -37,3 +37,30 @@ Se adopta la **Opción 3**:
 - **Negativas / Desafíos:**
   - Requiere configurar los clientes para apuntar a la URL base del gateway local (`http://127.0.0.1:8765/v1`) para rutas no interceptadas por plugins.
   - Se deben mantener adaptadores ligeros en TypeScript/JavaScript para OpenCode y Pi.
+
+---
+
+## ADR-002: Separación de Planos, Código de Rechazo HTTP 403 y Fail-Closed en Rutas Protegidas
+
+### Fecha
+14 de octubre de 2026
+
+### Estado
+Aceptado
+
+### Contexto
+Se requiere establecer cómo interactúan los clientes con el núcleo local, qué códigos de respuesta emitir ante un bloqueo y cómo actuar si el gateway se encuentra ante condiciones de error o ambigüedad.
+
+### Decisión
+1. **Separación Física de Puertos:**
+   - Data Plane (Inferencia): `127.0.0.1:8765`.
+   - Control Plane (Eventos y Estado): `127.0.0.1:8766` con Bearer Token obligatorio.
+   Esta separación previene que una solicitud de inferencia acceda por error o inyección a métodos de administración o modificación de políticas.
+2. **Uso de HTTP 403 en lugar de 429/503:**
+   - Respuestas HTTP 429 (Too Many Requests) o 503 (Service Unavailable) incitan a los SDKs de IA a aplicar reintentos exponenciales automáticos, lo cual saturaría la cola local y aumentaría la latencia.
+   - HTTP 403 con código de error `peakguard_policy_blocked` es interpretado de forma definitiva por los clientes, interrumpiendo el reintento de inmediato.
+3. **Principio Fail-Closed para Rutas Protegidas:**
+   - Si una ruta ha sido declarada como protegida y el gateway detecta inconsistencias en la regla horaria o el estado de la política, se rechaza la llamada localmente para evitar generar costos accidentales no autorizados en horario peak.
+4. **Idempotencia de Stop Nativo:**
+   - El evento de Stop solo se emite una vez por tupla `(session_id, turn_id, transition_utc)`. Si el adaptador no confirma en `ack_timeout_ms` (2000 ms), el gateway cancela el stream ascendente como salvaguarda secundaria.
+

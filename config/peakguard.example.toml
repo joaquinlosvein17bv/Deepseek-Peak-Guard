@@ -1,0 +1,64 @@
+config_version = 1
+
+[general]
+enabled = true
+mode = "restricted_stop"  # strict_block | restricted_stop | notify_only
+show_timezone = "America/Lima"
+start_on_login = false
+
+[alerts]
+minutes_before = [30, 10, 5]
+final_countdown_seconds = 10
+desktop = true
+tui = true
+telegram = false
+notify_on_peak_end = true
+
+[gateway]
+listen_address = "127.0.0.1"
+listen_port = 8765
+allow_remote_connections = false
+fail_closed_for_protected_routes = true
+active_stream_on_peak = "cancel"
+
+[control]
+listen_address = "127.0.0.1"
+listen_port = 8766
+token_env = "PEAKGUARD_CONTROL_TOKEN"
+
+[stop]
+ack_timeout_ms = 2000
+auto_resume = false
+fallback_to_gateway_cancel = true
+
+[telegram]
+bot_token_env = "PEAKGUARD_BOT_TOKEN"
+chat_id_env = "PEAKGUARD_CHAT_ID"
+
+[[providers]]
+id = "deepseek_direct"
+upstream = "https://api.deepseek.com"
+enabled = true
+schedule_id = "deepseek_direct_verified"
+
+[[providers]]
+id = "opencode_go"
+enabled = false
+schedule_id = "opencode_go_verified"
+# Upstream de OpenCode Go: habilitar una vez verificadas credenciales y ruta.
+
+[[schedules]]
+id = "deepseek_direct_verified"
+timezone = "UTC"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+intervals = ["01:00-04:00", "06:00-10:00"]
+exclude_chinese_public_holidays = true
+source_url = "https://api-docs.deepseek.com/quick_start/pricing/"
+
+[[schedules]]
+id = "opencode_go_verified"
+timezone = "UTC"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+intervals = ["01:00-04:00", "06:00-10:00"]
+exclude_chinese_public_holidays = false
+source_url = "https://opencode.ai/v2/docs/console/go/"
