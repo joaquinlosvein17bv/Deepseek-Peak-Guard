@@ -230,48 +230,16 @@ let reconnectTimer = null;
 let stableTimer = null;
 let isConnecting = false;
 let currentSseReq = null;
+let activeClient = null;
 
-/**
- * Conecta al stream de eventos SSE de PeakGuard para recibir órdenes de Stop nativo
- */
-export function startEventSubscriber(client) {
-  if (currentSseReq && !currentSseReq.destroyed && !currentSseReq.closed) {
-    return currentSseReq;
+// Procesar orden Stop (T18.1.2, T18.1.3, T18.1.6, T18.2.2, T18.3.1)
+export async function handleStopOrder(event, client = activeClient) {
+  const sessionID = event.session_id;
+
+  // Validación de client_instance_id si viene especificado
+  if (event.client_instance_id && event.client_instance_id !== CLIENT_INSTANCE_ID) {
+    return;
   }
-  isConnecting = true;
-
-  const token = getAuthToken();
-  const headers = {};
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-
-  const url = `${PEAKGUARD_CONTROL_URL}/api/v1/events`;
-
-  function scheduleReconnect() {
-    isConnecting = false;
-    currentSseReq = null;
-    if (stableTimer) {
-      clearTimeout(stableTimer);
-      stableTimer = null;
-    }
-    if (reconnectTimer) return;
-    reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      startEventSubscriber(client);
-    }, delay);
-  }
-
-  // Procesar orden Stop (T18.1.2, T18.1.3, T18.1.6, T18.2.2, T18.3.1)
-  async function handleStopOrder(event) {
-    const sessionID = event.session_id;
-
-    // Validación de client_instance_id si viene especificado
-    if (event.client_instance_id && event.client_instance_id !== CLIENT_INSTANCE_ID) {
-      return;
-    }
 
     // Aislamiento de sesión (T18.1.6):
     const currentSess = activeSessions.get(sessionID);
@@ -386,6 +354,40 @@ export function startEventSubscriber(client) {
       event.command_id,
       CLIENT_INSTANCE_ID
     );
+  }
+
+/**
+ * Conecta al stream de eventos SSE de PeakGuard para recibir órdenes de Stop nativo
+ */
+export function startEventSubscriber(client) {
+  activeClient = client;
+  if (currentSseReq && !currentSseReq.destroyed && !currentSseReq.closed) {
+    return currentSseReq;
+  }
+  isConnecting = true;
+
+  const token = getAuthToken();
+  const headers = {};
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const url = `${PEAKGUARD_CONTROL_URL}/api/v1/events`;
+
+  function scheduleReconnect() {
+    isConnecting = false;
+    currentSseReq = null;
+    if (stableTimer) {
+      clearTimeout(stableTimer);
+      stableTimer = null;
+    }
+    if (reconnectTimer) return;
+    reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      startEventSubscriber(client);
+    }, delay);
   }
 
   // Recuperar comandos pendientes perdidos durante desconexión (T18.1.3, T18.1.6)

@@ -266,4 +266,5 @@ async function runPiTests() {
   });
 
   console.log("=== Todas las pruebas de adaptadores T18.2 completadas con éxito ===");
+  process.exit(0);
 }

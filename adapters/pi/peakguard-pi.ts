@@ -153,16 +153,129 @@ export async function sendStopAck(
   return res.statusCode === 200 || res.statusCode === 202;
 }
 
+export let activeCtx: any = null;
+export let activeSessionId: string = "pi-default-session";
+export let activeTurnId: string | null = null;
+export let currentModel = "unknown";
+export let activePiAgent: any = null;
+export const processedStopKeys = new Set<string>();
+
+// Procesar orden Stop de manera centralizada (SSE o recuperación REST)
+export async function handleStopOrder(event: any, ctx: any = activeCtx, pi: any = activePiAgent) {
+  const targetSession = event.session_id;
+
+  // Validación estricta de instancia y sesión (T18.1.2)
+  if (event.client_instance_id && event.client_instance_id !== CLIENT_INSTANCE_ID) {
+    return;
+  }
+  if (!targetSession || targetSession !== activeSessionId) {
+    return;
+  }
+
+  const eventTurn = typeof event.turn_id === "string" ? event.turn_id.trim() : null;
+  const currentTurn = typeof activeTurnId === "string" ? activeTurnId.trim() : null;
+
+  // T18.3.1: Exigir coincidencia verificable entre instancia, sesión y turno antes de invocar abort nativo.
+  // Si falta event.turn_id o la identidad actual no puede comprobarse, no ejecutar un abort ambiguo.
+  if (!eventTurn || !currentTurn) {
+    const reason = !eventTurn && !currentTurn
+      ? "unverifiable_turn_identity: turno ausente en la orden y en la sesión"
+      : !eventTurn
+      ? "unverifiable_turn_identity: event.turn_id ausente en la orden de Stop"
+      : "unverifiable_turn_identity: la sesión actual no tiene un turno activo comprobable";
+    console.warn(`[PeakGuard:Pi] ${reason}. Se omite abort ambiguo y se mantiene bloqueo en gateway.`);
+    await sendStopAck(
+      targetSession,
+      event.transition_utc,
+      false,
+      reason,
+      eventTurn || currentTurn,
+      event.command_id,
+      CLIENT_INSTANCE_ID
+    );
+    return;
+  }
+
+  // T18.2.2 & T18.3.1: Una orden antigua (turn_id anterior) NUNCA debe cancelar un turno nuevo
+  if (eventTurn !== currentTurn) {
+    console.warn(
+      `[PeakGuard:Pi] Orden Stop descartada por discordancia de turno: orden para '${eventTurn}', pero turno actual activo es '${currentTurn}'.`
+    );
+    await sendStopAck(
+      targetSession,
+      event.transition_utc,
+      false,
+      "turn_mismatch",
+      eventTurn,
+      event.command_id,
+      CLIENT_INSTANCE_ID
+    );
+    return;
+  }
+
+  // Deduplicar órdenes de Stop repetidas por command_id o clave compuesta
+  const stopKey = event.command_id || `${targetSession}:${eventTurn}:${event.transition_utc || ""}`;
+  if (processedStopKeys.has(stopKey)) {
+    return;
+  }
+  processedStopKeys.add(stopKey);
+
+  console.warn(
+    `[PeakGuard:Pi] Orden de Stop recibida para '${targetSession}'. Abortando turno activo...`
+  );
+
+  let success = false;
+  let errorMsg: string | undefined;
+
+  // Invocación nativa sin matar proceso (Principio P1)
+  try {
+    const abortTarget = ctx || activeCtx;
+    const piTarget = pi || activePiAgent;
+    if (abortTarget && typeof abortTarget.abort === "function") {
+      abortTarget.abort();
+      success = true;
+      console.info("[PeakGuard:Pi] activeCtx.abort() ejecutado con éxito.");
+    } else if (typeof piTarget?.abort === "function") {
+      piTarget.abort();
+      success = true;
+      console.info("[PeakGuard:Pi] pi.abort() ejecutado con éxito.");
+    } else {
+      errorMsg = "Método abort() no disponible en activeCtx ni pi";
+      console.error(`[PeakGuard:Pi] ${errorMsg}`);
+    }
+  } catch (err: any) {
+    success = false;
+    errorMsg = err?.message || String(err);
+    console.error("[PeakGuard:Pi] Excepción al invocar abort():", err);
+  }
+
+  if (success) {
+    if (activeCtx?.ui?.notify) {
+      activeCtx.ui.notify(
+        "Turno cancelado por PeakGuard",
+        "Horario peak iniciado. Sesión e historial preservados."
+      );
+    }
+  }
+
+  // Enviar acuse con status REAL y command_id para entrega garantizada (T18.1.3)
+  await sendStopAck(
+    targetSession,
+    event.transition_utc,
+    success,
+    errorMsg,
+    event.turn_id,
+    event.command_id,
+    CLIENT_INSTANCE_ID
+  );
+}
+
 export default function peakguardExtension(pi: any) {
-  let activeCtx: any = null;
-  let activeSessionId: string = "pi-default-session";
-  let activeTurnId: string | null = null;
-  let currentModel = "unknown";
+  activePiAgent = pi;
   let sseReq: http.ClientRequest | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let reconnectAttempts = 0;
   let heartbeatTimer: NodeJS.Timeout | null = null;
-  const processedStopKeys = new Set<string>();
 
   function startHeartbeat() {
     stopHeartbeat();
@@ -269,114 +382,6 @@ export default function peakguardExtension(pi: any) {
       reconnectTimer = null;
       connectEvents();
     }, delay);
-  }
-
-  // Procesar orden Stop de manera centralizada (SSE o recuperación REST)
-  async function handleStopOrder(event: any) {
-    const targetSession = event.session_id;
-
-    // Validación estricta de instancia y sesión (T18.1.2)
-    if (event.client_instance_id && event.client_instance_id !== CLIENT_INSTANCE_ID) {
-      return;
-    }
-    if (!targetSession || targetSession !== activeSessionId) {
-      return;
-    }
-
-    const eventTurn = typeof event.turn_id === "string" ? event.turn_id.trim() : null;
-    const currentTurn = typeof activeTurnId === "string" ? activeTurnId.trim() : null;
-
-    // T18.3.1: Exigir coincidencia verificable entre instancia, sesión y turno antes de invocar abort nativo.
-    // Si falta event.turn_id o la identidad actual no puede comprobarse, no ejecutar un abort ambiguo.
-    if (!eventTurn || !currentTurn) {
-      const reason = !eventTurn && !currentTurn
-        ? "unverifiable_turn_identity: turno ausente en la orden y en la sesión"
-        : !eventTurn
-        ? "unverifiable_turn_identity: event.turn_id ausente en la orden de Stop"
-        : "unverifiable_turn_identity: la sesión actual no tiene un turno activo comprobable";
-      console.warn(`[PeakGuard:Pi] ${reason}. Se omite abort ambiguo y se mantiene bloqueo en gateway.`);
-      await sendStopAck(
-        targetSession,
-        event.transition_utc,
-        false,
-        reason,
-        eventTurn || currentTurn,
-        event.command_id,
-        CLIENT_INSTANCE_ID
-      );
-      return;
-    }
-
-    // T18.2.2 & T18.3.1: Una orden antigua (turn_id anterior) NUNCA debe cancelar un turno nuevo
-    if (eventTurn !== currentTurn) {
-      console.warn(
-        `[PeakGuard:Pi] Orden Stop descartada por discordancia de turno: orden para '${eventTurn}', pero turno actual activo es '${currentTurn}'.`
-      );
-      await sendStopAck(
-        targetSession,
-        event.transition_utc,
-        false,
-        "turn_mismatch",
-        eventTurn,
-        event.command_id,
-        CLIENT_INSTANCE_ID
-      );
-      return;
-    }
-
-    // Deduplicar órdenes de Stop repetidas por command_id o clave compuesta
-    const stopKey = event.command_id || `${targetSession}:${eventTurn}:${event.transition_utc || ""}`;
-    if (processedStopKeys.has(stopKey)) {
-      return;
-    }
-    processedStopKeys.add(stopKey);
-
-    console.warn(
-      `[PeakGuard:Pi] Orden de Stop recibida para '${targetSession}'. Abortando turno activo...`
-    );
-
-    let success = false;
-    let errorMsg: string | undefined;
-
-    // Invocación nativa sin matar proceso (Principio P1)
-    try {
-      if (activeCtx && typeof activeCtx.abort === "function") {
-        activeCtx.abort();
-        success = true;
-        console.info("[PeakGuard:Pi] activeCtx.abort() ejecutado con éxito.");
-      } else if (typeof pi?.abort === "function") {
-        pi.abort();
-        success = true;
-        console.info("[PeakGuard:Pi] pi.abort() ejecutado con éxito.");
-      } else {
-        errorMsg = "Método abort() no disponible en activeCtx ni pi";
-        console.error(`[PeakGuard:Pi] ${errorMsg}`);
-      }
-    } catch (err: any) {
-      success = false;
-      errorMsg = err?.message || String(err);
-      console.error("[PeakGuard:Pi] Excepción al invocar abort():", err);
-    }
-
-    if (success) {
-      if (activeCtx?.ui?.notify) {
-        activeCtx.ui.notify(
-          "Turno cancelado por PeakGuard",
-          "Horario peak iniciado. Sesión e historial preservados."
-        );
-      }
-    }
-
-    // Enviar acuse con status REAL y command_id para entrega garantizada (T18.1.3)
-    await sendStopAck(
-      targetSession,
-      event.transition_utc,
-      success,
-      errorMsg,
-      event.turn_id,
-      event.command_id,
-      CLIENT_INSTANCE_ID
-    );
   }
 
   // Recuperar comandos pendientes perdidos durante desconexión (T18.1.3)

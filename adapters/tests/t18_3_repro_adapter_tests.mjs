@@ -273,4 +273,5 @@ mockServer.listen(0, "127.0.0.1", async () => {
   cleanupPi();
   mockServer.close();
   console.log("=== Todas las pruebas de reproducción T18.3 en adaptadores pasaron ===");
+  process.exit(0);
 });
