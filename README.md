@@ -121,11 +121,12 @@ peakguard mcp --config config\peakguard.example.toml
 
 ## 🧪 Pruebas y Verificación
 
-PeakGuard cuenta con una suite automatizada de **41 pruebas unitarias y de integración en Rust**, más pruebas dinámicas en Node.js para adaptadores:
+PeakGuard cuenta con una suite automatizada de **47 pruebas unitarias y de integración en Rust**, más pruebas dinámicas en Node.js para adaptadores:
 - 100% de los casos límite de fixtures JSON (`test-fixtures/schedules/boundary_test_cases.json`).
+- **Seguridad Criptográfica y Ciclo de Vida T18 (`t18_security_and_lifecycle_tests`):** Valida generación CSPRNG con `ring`, rechazo estricto de tokens vacíos (`fail-closed`), rechazo de tokens en query params SSE vs. aceptación de cabeceras `Authorization: Bearer`, preservación de turnos de razonamiento activo (`deepseek-reasoner`) hasta 30 minutos frente al umbral inactivo de 60s, y transiciones dinámicas y honestas de cobertura (`PARTIAL` → `PROTECTED`).
 - **Prueba E2E del Binario Real (`real_daemon_e2e_tests`):** Levanta el subproceso ejecutable `peakguard run` con puertos efímeros dinámicos, reloj simulado (`PEAKGUARD_SIMULATED_TIME`), valida rechazo 401 sin Bearer Token, acuses Stop ACK con `success` obligatorio (422 ante omisión), registro de sesiones activas, filtrado de modelos y apagado ordenado nativo vía `POST /api/v1/control/shutdown`.
 - **Cancelación Activa de Streams SSE (`stream_cancellation_tests`):** Demuestra que el cruce de frontera hacia horario pico corta inmediatamente el flujo mediante temporizador autónomo Tokio (incluso sin llegada de nuevos chunks) y emite un payload de error compatible con OpenAI, impidiendo fugas de tokens, mientras que `notify_only` permite la finalización limpia.
-- **Suite de Adaptadores en Node.js (`adapters/tests/adapter-mock-runner.test.mjs`):** Valida la integración con `client.session.abort()`, acuse de fallo estricto sin falsos positivos y widget TUI.
+- **Suite de Adaptadores en Node.js (`adapters/tests/adapter-mock-runner.test.mjs`):** Valida la integración con `client.session.abort()`, `activeCtx.abort()`, aislamiento de sesiones frente a eventos foráneos, acuses reales sin falsos positivos, notificación `is_active: false` en `agent_settled` y widget TUI.
 - Detección de saltos bruscos en el reloj del sistema operativo (suspensión/reanudación de Windows).
 - Pruebas E2E de gateway con servidor HTTP simulado y streaming concurrente (20 streams simultáneos).
 - Deduplicación de Stop invariante por inicio de ventana pico (`current_peak_window_start`).
@@ -163,6 +164,8 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke-test.ps1
 - 🔍 [Auditoría T16.1 de Problemas Pendientes](AUDITORIA_T16_1.md)
 - 🚀 [Informe de Implementación Técnica T17](T17_IMPLEMENTATION_REPORT.md)
 - 📊 [Evidencias Técnicas de Pruebas T17](T17_TEST_EVIDENCE.md)
+- 🛡️ [Informe de Estabilización y Auditoría T18](T18_AUDIT_AND_FIX_REPORT.md)
+- 📈 [Evidencias Técnicas de Pruebas T18](T18_TEST_EVIDENCE.md)
 - 🗺️ [Backlog Futuro y Roadmap v1.1+](docs/FUTURE_BACKLOG.md)
 - 📋 [Especificación y Plan Maestro Original](PeakGuard_Especificacion_Plan_Maestro.md)
 
