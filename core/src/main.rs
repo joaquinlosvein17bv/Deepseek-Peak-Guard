@@ -1,6 +1,9 @@
+pub mod clock;
 mod commands;
-mod config;
+pub mod config;
 mod logger;
+pub mod registry;
+pub mod schedule;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
