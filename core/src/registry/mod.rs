@@ -101,6 +101,8 @@ impl Default for ModelRegistry {
             aliases: vec![
                 "deepseek/deepseek-chat".to_string(),
                 "deepseek-v3".to_string(),
+                "deepseek-flash".to_string(),
+                "deepseek/deepseek-flash".to_string(),
             ],
             provider_id: "deepseek_direct".to_string(),
         });

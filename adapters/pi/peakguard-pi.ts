@@ -118,6 +118,10 @@ export async function registerActiveSession(
   model = "unknown",
   clientInstanceId = CLIENT_INSTANCE_ID
 ): Promise<boolean> {
+  activeSessionId = sessionID;
+  if (turnID) {
+    activeTurnId = turnID;
+  }
   const isDeepSeek = Boolean(model && (model.toLowerCase().includes("deepseek") || model.toLowerCase().startsWith("deepseek")));
   const provider_id = isDeepSeek ? "deepseek_direct" : (model === "unknown" ? "unknown" : "other");
   const res = await sendControlRequest("/api/v1/sessions/register", "POST", {
