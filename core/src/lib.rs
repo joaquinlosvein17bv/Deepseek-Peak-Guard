@@ -1,5 +1,6 @@
 pub mod clock;
 pub mod config;
+pub mod control_api;
 pub mod gateway;
 pub mod logger;
 pub mod policy;
