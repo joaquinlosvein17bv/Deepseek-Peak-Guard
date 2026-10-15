@@ -137,7 +137,7 @@ function stopPeriodicHeartbeat(sessionID) {
 export async function registerActiveSession(
   sessionID,
   model = "unknown",
-  provider = "deepseek_direct",
+  provider = "unknown",
   turnID = null,
   clientInstanceId = CLIENT_INSTANCE_ID
 ) {
@@ -264,7 +264,7 @@ export function startEventSubscriber(client) {
     }, delay);
   }
 
-  // Procesar orden Stop (T18.1.2, T18.1.3, T18.1.6)
+  // Procesar orden Stop (T18.1.2, T18.1.3, T18.1.6, T18.2.2)
   async function handleStopOrder(event) {
     const sessionID = event.session_id;
     const turnID = event.turn_id || null;
@@ -275,23 +275,77 @@ export function startEventSubscriber(client) {
     }
 
     // Aislamiento de sesión (T18.1.6):
-    // Si la sesión solicitada no está registrada en este cliente local, ignorar
-    if (!activeSessions.has(sessionID)) {
+    const currentSess = activeSessions.get(sessionID);
+    if (!currentSess) {
       console.info(
         `[PeakGuard:OpenCode] Sesión '${sessionID}' no pertenece a este cliente OpenCode. Ignorando orden.`
       );
       return;
     }
 
+    // T18.2.2: Validación estricta de turn_id para evitar abortar turnos nuevos
+    // 1. Una orden antigua (turn_id anterior) NUNCA debe cancelar un turno nuevo
+    if (turnID && currentSess.turnID && currentSess.turnID !== turnID) {
+      console.warn(
+        `[PeakGuard:OpenCode] Orden Stop antigua descartada: orden para '${turnID}', pero turno activo actual es '${currentSess.turnID}'. No se aborta el turno nuevo.`
+      );
+      await sendStopAck(
+        sessionID,
+        event.transition_utc,
+        false,
+        `turn_mismatch: orden para '${turnID}', pero turno actual es '${currentSess.turnID}'`,
+        turnID,
+        event.command_id,
+        CLIENT_INSTANCE_ID
+      );
+      return;
+    }
+
+    // 2. Si la sesión no tiene un turno en ejecución activa, descartar
+    if (!currentSess.isActive) {
+      console.info(
+        `[PeakGuard:OpenCode] Sesión '${sessionID}' no tiene ningún turno activo en ejecución. Descartando Stop.`
+      );
+      await sendStopAck(
+        sessionID,
+        event.transition_utc,
+        true,
+        null,
+        turnID || currentSess.turnID,
+        event.command_id,
+        CLIENT_INSTANCE_ID
+      );
+      return;
+    }
+
+    // 3. Si no existe identidad de turno verificable en el cliente, evitar abort ambiguo
+    if (!turnID && !currentSess.turnID) {
+      const abortError = "unverifiable_turn_identity_fallback_to_gateway";
+      console.warn(
+        `[PeakGuard:OpenCode] Identidad de turno no verificable en sesión '${sessionID}'. Evitando abort ambiguo y aplicando fallback de gateway.`
+      );
+      await sendStopAck(
+        sessionID,
+        event.transition_utc,
+        false,
+        abortError,
+        null,
+        event.command_id,
+        CLIENT_INSTANCE_ID
+      );
+      return;
+    }
+
     // Deduplicar órdenes de Stop repetidas por command_id o clave compuesta
-    const stopKey = event.command_id || `${sessionID}:${turnID || ""}:${event.transition_utc || ""}`;
+    const effectiveTurn = turnID || currentSess.turnID || "";
+    const stopKey = event.command_id || `${sessionID}:${effectiveTurn}:${event.transition_utc || ""}`;
     if (processedStopKeys.has(stopKey)) {
       return;
     }
     processedStopKeys.add(stopKey);
 
     console.warn(
-      `[PeakGuard:OpenCode] Recibida orden de Stop nativo para sesión '${sessionID}'. Abortando turno activo...`
+      `[PeakGuard:OpenCode] Recibida orden de Stop nativo válida para sesión '${sessionID}' (turno '${effectiveTurn}'). Abortando turno activo...`
     );
 
     let abortSuccess = false;
@@ -304,7 +358,7 @@ export function startEventSubscriber(client) {
         await client.session.abort({ path: { id: sessionID } });
         abortSuccess = true;
         console.info(
-          `[PeakGuard:OpenCode] Turno abortado exitosamente mediante client.session.abort({ id: '${sessionID}' }).`
+          `[PeakGuard:OpenCode] Turno '${effectiveTurn}' abortado exitosamente mediante client.session.abort({ id: '${sessionID}' }).`
         );
       } catch (err) {
         abortSuccess = false;
@@ -317,13 +371,13 @@ export function startEventSubscriber(client) {
       console.error(`[PeakGuard:OpenCode] ${abortError}`);
     }
 
-    // Enviar acuse con el estado REAL y command_id (T18.1.3)
+    // Enviar acuse con el estado REAL y command_id (T18.1.3, T18.2.3)
     await sendStopAck(
       sessionID,
       event.transition_utc,
       abortSuccess,
       abortError,
-      turnID,
+      effectiveTurn,
       event.command_id,
       CLIENT_INSTANCE_ID
     );
@@ -414,9 +468,13 @@ export const PeakGuardServerPlugin = async (input) => {
       const properties = event?.properties ?? {};
       const sessionID = properties?.sessionID || properties?.info?.id;
       const model = properties?.info?.model || properties?.model || "unknown";
+      let provider = properties?.provider || properties?.info?.provider || "unknown";
+      if (provider === "unknown" && typeof model === "string" && model.toLowerCase().includes("deepseek")) {
+        provider = "deepseek_direct";
+      }
 
       if (type === "session.created" && sessionID) {
-        await registerActiveSession(sessionID, model);
+        await registerActiveSession(sessionID, model, provider);
       }
 
       if (type === "message.created" && sessionID) {

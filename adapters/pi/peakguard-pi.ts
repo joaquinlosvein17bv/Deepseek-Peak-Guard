@@ -118,13 +118,15 @@ export async function registerActiveSession(
   model = "unknown",
   clientInstanceId = CLIENT_INSTANCE_ID
 ): Promise<boolean> {
+  const isDeepSeek = Boolean(model && (model.toLowerCase().includes("deepseek") || model.toLowerCase().startsWith("deepseek")));
+  const provider_id = isDeepSeek ? "deepseek_direct" : (model === "unknown" ? "unknown" : "other");
   const res = await sendControlRequest("/api/v1/sessions/register", "POST", {
     session_id: sessionID,
     client_type: "pi",
     client_instance_id: clientInstanceId,
     turn_id: turnID,
     model,
-    provider_id: "deepseek_direct",
+    provider_id,
     is_active: true,
   });
   return res.statusCode === 200;
@@ -239,7 +241,27 @@ export default function peakguardExtension(pi: any) {
   updateStatusDisplay();
   const pollInterval = setInterval(updateStatusDisplay, 15000);
 
+  let isConnecting = false;
+  let stableTimer: NodeJS.Timeout | null = null;
+
+  function clearStableTimer() {
+    if (stableTimer) {
+      clearTimeout(stableTimer);
+      stableTimer = null;
+    }
+  }
+
   function scheduleReconnect() {
+    clearStableTimer();
+    isConnecting = false;
+    if (sseReq && !sseReq.destroyed) {
+      try {
+        sseReq.destroy();
+      } catch {
+        // Ignorar
+      }
+      sseReq = null;
+    }
     if (reconnectTimer) return;
     reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 15000);
@@ -261,8 +283,39 @@ export default function peakguardExtension(pi: any) {
       return;
     }
 
-    // Si se especifica turn_id y se conoce el turno activo, validar correspondencia
+    // T18.2.2: Validación estricta de turn_id
+    // Si la orden de Stop especifica turn_id y la sesión activa tiene un activeTurnId diferente,
+    // es una orden tardía para un turno previo: NO cancelar el nuevo turno.
     if (event.turn_id && activeTurnId && event.turn_id !== activeTurnId) {
+      console.warn(
+        `[PeakGuard:Pi] Orden Stop descartada por discordancia de turno: la orden es para '${event.turn_id}', pero el turno actual activo es '${activeTurnId}'.`
+      );
+      await sendStopAck(
+        targetSession,
+        event.transition_utc,
+        false,
+        "turn_mismatch",
+        event.turn_id,
+        event.command_id,
+        CLIENT_INSTANCE_ID
+      );
+      return;
+    }
+
+    // Si la sesión no tiene un turno activo o su identidad es inverificable, no ejecutar abort ambiguo
+    if (!activeTurnId) {
+      console.warn(
+        `[PeakGuard:Pi] Turno no activo o identidad inverificable en sesión '${targetSession}'. Se omite abort ambiguo y se delega en fallback del gateway.`
+      );
+      await sendStopAck(
+        targetSession,
+        event.transition_utc,
+        false,
+        "no_active_turn_or_unverifiable",
+        event.turn_id,
+        event.command_id,
+        CLIENT_INSTANCE_ID
+      );
       return;
     }
 
@@ -340,6 +393,18 @@ export default function peakguardExtension(pi: any) {
 
   // 3. Conectar a eventos SSE del Control API de PeakGuard
   function connectEvents() {
+    if (isConnecting) return;
+    isConnecting = true;
+
+    if (sseReq && !sseReq.destroyed) {
+      try {
+        sseReq.destroy();
+      } catch {
+        // Ignorar
+      }
+      sseReq = null;
+    }
+
     const token = getAuthToken();
     const headers: Record<string, string> = {};
     if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -352,7 +417,16 @@ export default function peakguardExtension(pi: any) {
         return;
       }
 
-      reconnectAttempts = 0;
+      isConnecting = false;
+
+      // T18.2.5: No resetear reconnectAttempts inmediatamente tras HTTP 200.
+      // Solo resetear el contador de reintentos tras 5 segundos de conexión estable ininterrumpida.
+      clearStableTimer();
+      stableTimer = setTimeout(() => {
+        reconnectAttempts = 0;
+        stableTimer = null;
+      }, 5000);
+
       // Recuperar comandos pendientes al conectar/reconectar
       fetchPendingCommands();
 
@@ -381,6 +455,10 @@ export default function peakguardExtension(pi: any) {
       res.on("end", () => {
         scheduleReconnect();
       });
+
+      res.on("close", () => {
+        scheduleReconnect();
+      });
     });
 
     sseReq.on("error", () => {
@@ -391,9 +469,10 @@ export default function peakguardExtension(pi: any) {
   connectEvents();
 
   return () => {
+    clearStableTimer();
     stopHeartbeat();
     clearInterval(pollInterval);
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    if (sseReq) sseReq.destroy();
+    if (sseReq && !sseReq.destroyed) sseReq.destroy();
   };
 }

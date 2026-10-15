@@ -1,6 +1,6 @@
 use crate::clock::Clock;
 use crate::policy::{OperatingMode, PolicyEngine, StopKey};
-use crate::registry::{ActiveSession, ModelRegistry, SessionRegistry};
+use crate::registry::{ActiveSession, ModelRegistry, SessionRegistry, StopCommandStatus};
 use crate::schedule::Schedule;
 use axum::{
     extract::State,
@@ -185,14 +185,27 @@ async fn handle_status(State(state): State<ControlApiState>) -> Json<StatusRespo
                     }),
                 )
             } else if direct_enabled {
-                // T18.1.1: Solo declarar PROTECTED si el gateway ha intermediado tráfico real de DeepSeek
-                // o hay sesión activa conectada ESPECÍFICAMENTE de DeepSeek (no de Claude, GPT u otros)
-                if direct_traffic_observed || direct_active_sessions > 0 {
+                // T18.2.1: NUNCA declarar PROTECTED basándose únicamente en el registro de una sesión.
+                // Se requiere tráfico real observado a través del Gateway loopback (direct_traffic_observed).
+                // Si hay sesión registrada pero sin tráfico intermediado en gateway, se reporta PARTIAL.
+                if direct_traffic_observed {
                     (
                         "PROTECTED".to_string(),
                         serde_json::json!({
                             "verified_route": "deepseek_direct",
                             "observed_requests_for_deepseek": total_observed,
+                            "active_sessions_for_deepseek": direct_active_sessions,
+                            "total_active_sessions": active_sessions,
+                            "gateway_operational": true,
+                        }),
+                    )
+                } else if direct_active_sessions > 0 {
+                    (
+                        "PARTIAL".to_string(),
+                        serde_json::json!({
+                            "reason": "session_registered_awaiting_gateway_traffic",
+                            "configured_route": "deepseek_direct",
+                            "observed_requests_for_deepseek": 0,
                             "active_sessions_for_deepseek": direct_active_sessions,
                             "total_active_sessions": active_sessions,
                             "gateway_operational": true,
@@ -252,10 +265,25 @@ async fn handle_stop_ack(
             .into_response();
     }
 
+    let client_instance_id = match payload.client_instance_id.as_deref() {
+        Some(id) if !id.trim().is_empty() => id.trim(),
+        _ => {
+            warn!("Stop ACK rechazado: 'client_instance_id' es obligatorio y no fue provisto.");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "missing_client_instance_id",
+                    "message": "El campo 'client_instance_id' es obligatorio en StopAckRequest"
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let cmd_mgr = state.session_registry.get_command_manager();
     let ack_res = cmd_mgr.record_ack(
         payload.command_id.as_deref(),
-        payload.client_instance_id.as_deref(),
+        Some(client_instance_id),
         &payload.session_id,
         payload.turn_id.as_deref(),
         payload.success,
@@ -266,8 +294,15 @@ async fn handle_stop_ack(
         Ok(c) => c,
         Err(err_msg) => {
             warn!("Rechazo de Stop ACK por discordancia o falta de autorización: {}", err_msg);
+            let status = if err_msg.contains("Instancia no autorizada") {
+                StatusCode::FORBIDDEN
+            } else if err_msg.contains("no encontrado") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
             return (
-                StatusCode::FORBIDDEN,
+                status,
                 Json(serde_json::json!({
                     "error": err_msg,
                     "session_id": payload.session_id
@@ -277,50 +312,83 @@ async fn handle_stop_ack(
         }
     };
 
-    let key = StopKey {
-        session_id: payload.session_id.clone(),
-        turn_id: payload.turn_id.clone().unwrap_or_else(|| "default".to_string()),
-        transition_utc: payload.transition_utc.clone(),
-    };
-
-    if payload.success {
-        info!(
-            "Stop ACK exitoso confirmado por adaptador: cmd='{}', session_id='{}', turn_id='{:?}'",
-            recorded_cmd.command_id, payload.session_id, payload.turn_id
-        );
-        state.policy_engine.acknowledge_stop(key);
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "acknowledged",
-                "success": true,
-                "command_id": recorded_cmd.command_id,
-                "session_id": payload.session_id
-            })),
-        )
-            .into_response()
-    } else {
-        warn!(
-            "Stop ACK con FALLO reportado por adaptador: cmd='{}', session_id='{}', error='{:?}'. Stop NO será marcado como exitoso.",
-            recorded_cmd.command_id, payload.session_id, payload.error
-        );
-        let _ = state.event_tx.send(format!(
-            "{{\"type\":\"stop_failed\",\"command_id\":\"{}\",\"session_id\":\"{}\",\"error\":\"{}\"}}",
-            recorded_cmd.command_id,
-            payload.session_id,
-            payload.error.unwrap_or_else(|| "Abort failed".to_string())
-        ));
-        (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "status": "failed",
-                "success": false,
-                "command_id": recorded_cmd.command_id,
-                "session_id": payload.session_id,
-                "fallback": "gateway_cancel"
-            })),
-        )
-            .into_response()
+    match recorded_cmd.status {
+        StopCommandStatus::Acknowledged => {
+            let key = StopKey {
+                session_id: payload.session_id.clone(),
+                turn_id: payload.turn_id.clone().unwrap_or_else(|| "default".to_string()),
+                transition_utc: payload.transition_utc.clone(),
+            };
+            info!(
+                "Stop ACK exitoso confirmado por adaptador: cmd='{}', session_id='{}', turn_id='{:?}'",
+                recorded_cmd.command_id, payload.session_id, payload.turn_id
+            );
+            state.policy_engine.acknowledge_stop(key);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "acknowledged",
+                    "success": true,
+                    "command_id": recorded_cmd.command_id,
+                    "session_id": payload.session_id
+                })),
+            )
+                .into_response()
+        }
+        StopCommandStatus::Failed => {
+            warn!(
+                "Stop ACK con FALLO reportado por adaptador: cmd='{}', session_id='{}', error='{:?}'. Stop NO será marcado como exitoso.",
+                recorded_cmd.command_id, payload.session_id, recorded_cmd.ack_error
+            );
+            let _ = state.event_tx.send(format!(
+                "{{\"type\":\"stop_failed\",\"command_id\":\"{}\",\"session_id\":\"{}\",\"error\":\"{}\"}}",
+                recorded_cmd.command_id,
+                payload.session_id,
+                recorded_cmd.ack_error.as_deref().unwrap_or("Abort failed")
+            ));
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "success": false,
+                    "command_id": recorded_cmd.command_id,
+                    "session_id": payload.session_id,
+                    "fallback": "gateway_cancel",
+                    "error": recorded_cmd.ack_error
+                })),
+            )
+                .into_response()
+        }
+        StopCommandStatus::Expired => {
+            warn!(
+                "Stop ACK para comando EXPIRADO: cmd='{}', session_id='{}'.",
+                recorded_cmd.command_id, payload.session_id
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "expired",
+                    "success": false,
+                    "command_id": recorded_cmd.command_id,
+                    "session_id": payload.session_id,
+                    "fallback": "gateway_cancel",
+                    "error": "Comando expirado"
+                })),
+            )
+                .into_response()
+        }
+        StopCommandStatus::Pending => {
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "pending",
+                    "success": false,
+                    "command_id": recorded_cmd.command_id,
+                    "session_id": payload.session_id
+                })),
+            )
+                .into_response()
+        }
     }
 }
 

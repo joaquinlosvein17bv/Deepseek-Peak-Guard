@@ -307,11 +307,97 @@ pub struct StopCommand {
 #[derive(Default)]
 pub struct StopCommandManager {
     commands: RwLock<HashMap<String, StopCommand>>,
+    persistence_path: Option<std::path::PathBuf>,
 }
 
 impl StopCommandManager {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            commands: RwLock::new(HashMap::new()),
+            persistence_path: None,
+        }
+    }
+
+    pub fn with_persistence(path: std::path::PathBuf) -> Self {
+        let mut commands = HashMap::new();
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(loaded) = serde_json::from_str::<Vec<StopCommand>>(&data) {
+                    let now = Utc::now();
+                    for mut cmd in loaded {
+                        let age = now.signed_duration_since(cmd.created_at);
+                        if age.num_minutes() >= 10 && cmd.status == StopCommandStatus::Pending {
+                            cmd.status = StopCommandStatus::Expired;
+                            cmd.ack_error = Some("Expirado tras reinicio del daemon (>10m)".to_string());
+                        }
+                        commands.insert(cmd.command_id.clone(), cmd);
+                    }
+                }
+            }
+        }
+        let mgr = Self {
+            commands: RwLock::new(commands),
+            persistence_path: Some(path),
+        };
+        mgr.persist_to_disk();
+        mgr
+    }
+
+    fn persist_to_disk(&self) {
+        if let Some(ref path) = self.persistence_path {
+            let map = match self.commands.read() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let list: Vec<StopCommand> = map.values().cloned().collect();
+            drop(map);
+
+            if let Ok(json) = serde_json::to_string_pretty(&list) {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+                if let Ok(mut f) = std::fs::File::create(&tmp_path) {
+                    use std::io::Write;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(perms) = f.metadata().map(|m| m.permissions()) {
+                            let mut p = perms;
+                            p.set_mode(0o600);
+                            let _ = f.set_permissions(p);
+                        }
+                    }
+                    if f.write_all(json.as_bytes()).is_ok() && f.sync_all().is_ok() {
+                        let _ = std::fs::rename(&tmp_path, path);
+                    } else {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get_command(&self, command_id: &str) -> Option<StopCommand> {
+        let map = self.commands.read().unwrap();
+        map.get(command_id).cloned()
+    }
+
+    pub fn expire_stale_commands(&self, max_age: chrono::Duration) {
+        let mut map = self.commands.write().unwrap();
+        let now = Utc::now();
+        let mut changed = false;
+        for cmd in map.values_mut() {
+            if cmd.status == StopCommandStatus::Pending && (now - cmd.created_at) >= max_age {
+                cmd.status = StopCommandStatus::Expired;
+                cmd.ack_error = Some("Expirado por timeout de orden".to_string());
+                changed = true;
+            }
+        }
+        drop(map);
+        if changed {
+            self.persist_to_disk();
+        }
     }
 
     pub fn create_command(
@@ -349,6 +435,8 @@ impl StopCommandManager {
         };
         let mut map = self.commands.write().unwrap();
         map.insert(command_id, cmd.clone());
+        drop(map);
+        self.persist_to_disk();
         cmd
     }
 
@@ -391,9 +479,20 @@ impl StopCommandManager {
                         cid, cmd.session_id, session_id
                     ));
                 }
+                if let (Some(cmd_turn), Some(ack_turn)) = (cmd.turn_id.as_deref(), turn_id) {
+                    if cmd_turn != ack_turn {
+                        return Err(format!(
+                            "Turno discordante: command_id '{}' pertenece a turno '{}', pero fue respondido para turno '{}'",
+                            cid, cmd_turn, ack_turn
+                        ));
+                    }
+                }
 
-                // Idempotencia: si ya fue confirmado, retornar estado sin duplicar acciones
-                if cmd.status == StopCommandStatus::Acknowledged || cmd.status == StopCommandStatus::Failed {
+                // Idempotencia: si ya está en estado terminal, retornar estado sin duplicar acciones ni mutar
+                if cmd.status == StopCommandStatus::Acknowledged
+                    || cmd.status == StopCommandStatus::Failed
+                    || cmd.status == StopCommandStatus::Expired
+                {
                     return Ok(cmd.clone());
                 }
 
@@ -405,7 +504,10 @@ impl StopCommandManager {
                 cmd.acked_at = Some(Utc::now());
                 cmd.ack_success = Some(success);
                 cmd.ack_error = error;
-                return Ok(cmd.clone());
+                let res = cmd.clone();
+                drop(map);
+                self.persist_to_disk();
+                return Ok(res);
             } else {
                 return Err(format!("Comando con command_id '{}' no encontrado en el registro", cid));
             }
@@ -432,8 +534,28 @@ impl StopCommandManager {
             cmd.acked_at = Some(Utc::now());
             cmd.ack_success = Some(success);
             cmd.ack_error = error;
-            Ok(cmd.clone())
+            let res = cmd.clone();
+            drop(map);
+            self.persist_to_disk();
+            Ok(res)
         } else {
+            // Revisar si ya existe un comando terminal coincidente para evitar crear duplicados o mutar
+            let terminal_cmd = map
+                .values()
+                .find(|c| {
+                    (c.status == StopCommandStatus::Acknowledged
+                        || c.status == StopCommandStatus::Failed
+                        || c.status == StopCommandStatus::Expired)
+                        && c.session_id == session_id
+                        && client_instance_id.map(|inst| c.client_instance_id == inst).unwrap_or(true)
+                        && (turn_id.is_none() || c.turn_id.as_deref() == turn_id)
+                })
+                .cloned();
+
+            if let Some(term) = terminal_cmd {
+                return Ok(term);
+            }
+
             // No hay comando pendiente: registrar acuse seguro para no fallar cliente legacy
             let fallback_id = format!("ack_legacy_{}", Utc::now().timestamp_millis());
             let cmd = StopCommand {
@@ -453,6 +575,8 @@ impl StopCommandManager {
                 ack_error: error,
             };
             map.insert(fallback_id, cmd.clone());
+            drop(map);
+            self.persist_to_disk();
             Ok(cmd)
         }
     }
@@ -475,6 +599,25 @@ impl Default for SessionRegistry {
 impl SessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_persistence_path(path: std::path::PathBuf) -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            command_manager: std::sync::Arc::new(StopCommandManager::with_persistence(path)),
+        }
+    }
+
+    pub fn new_with_persistence() -> Self {
+        let commands_path = if let Ok(p) = std::env::var("PEAKGUARD_COMMANDS_PATH") {
+            std::path::PathBuf::from(p)
+        } else {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| ".".to_string());
+            std::path::PathBuf::from(home).join(".peakguard").join("pending_commands.json")
+        };
+        Self::with_persistence_path(commands_path)
     }
 
     pub fn get_command_manager(&self) -> std::sync::Arc<StopCommandManager> {

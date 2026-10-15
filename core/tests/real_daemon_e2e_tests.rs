@@ -245,6 +245,7 @@ exclude_chinese_public_holidays = true
         .post(format!("http://127.0.0.1:{}/api/v1/adapters/stop-ack", ctrl_port))
         .header("Authorization", format!("Bearer {}", auth_token))
         .json(&serde_json::json!({
+            "client_instance_id": "inst_daemon_test",
             "session_id": "test-session-ack-ok",
             "transition_utc": "2026-10-15T01:00:00Z",
             "success": true
@@ -259,6 +260,7 @@ exclude_chinese_public_holidays = true
         .post(format!("http://127.0.0.1:{}/api/v1/adapters/stop-ack", ctrl_port))
         .header("Authorization", format!("Bearer {}", auth_token))
         .json(&serde_json::json!({
+            "client_instance_id": "inst_daemon_test",
             "session_id": "test-session-ack-fail",
             "transition_utc": "2026-10-15T01:00:00Z",
             "success": false,

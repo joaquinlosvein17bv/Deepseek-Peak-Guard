@@ -94,10 +94,25 @@ async fn test_repro_foreign_provider_session_causes_false_protected() {
         .await
         .unwrap();
     let json2: serde_json::Value = res2.json().await.unwrap();
+    // T18.2.1: Registrar sesión de DeepSeek NO otorga PROTECTED por sí sola; permanece en PARTIAL
     assert_eq!(
         json2["coverage"].as_str().unwrap(),
+        "PARTIAL",
+        "Registrar sesión sin tráfico observado por gateway debe reportar PARTIAL"
+    );
+
+    // Tras observar tráfico real a través del gateway para DeepSeek, recién transiciona a PROTECTED
+    registry.record_observed_traffic("deepseek_direct", "deepseek-chat");
+    let res3 = client
+        .get(format!("http://{}/api/v1/status", addr))
+        .send()
+        .await
+        .unwrap();
+    let json3: serde_json::Value = res3.json().await.unwrap();
+    assert_eq!(
+        json3["coverage"].as_str().unwrap(),
         "PROTECTED",
-        "Al registrar una sesión activa de DeepSeek, la cobertura debe ser PROTECTED"
+        "Con tráfico real observado en gateway para DeepSeek transiciona a PROTECTED"
     );
 }
 

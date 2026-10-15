@@ -72,7 +72,7 @@ pub async fn execute<P: AsRef<Path>>(config_path: P) -> Result<(), Box<dyn std::
 
     // 4. Canal de eventos SSE y registro central de sesiones
     let (event_tx, _) = broadcast::channel::<String>(256);
-    let session_registry = Arc::new(SessionRegistry::new());
+    let session_registry = Arc::new(SessionRegistry::new_with_persistence());
 
     // Soporte para reloj simulado determinista en pruebas E2E (vía PEAKGUARD_SIMULATED_TIME)
     let (clock, test_clock_opt): (Arc<dyn Clock>, Option<TestClock>) =
