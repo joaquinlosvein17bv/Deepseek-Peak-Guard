@@ -1,0 +1,13 @@
+{
+  "id": "opencode_go_verified",
+  "provider": "opencode_go",
+  "timezone": "UTC",
+  "weekdays": ["mon", "tue", "wed", "thu", "fri"],
+  "intervals": [
+    { "start": "01:00:00", "end": "04:00:00" },
+    { "start": "06:00:00", "end": "10:00:00" }
+  ],
+  "exclude_chinese_public_holidays": false,
+  "source_url": "https://opencode.ai/v2/docs/console/go/",
+  "checked_at": "2026-10-14T00:00:00Z"
+}
