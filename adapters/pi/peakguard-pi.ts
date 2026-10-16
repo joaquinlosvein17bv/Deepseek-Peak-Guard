@@ -115,21 +115,22 @@ export function formatPiStatusLabel(status: any): string {
 export async function registerActiveSession(
   sessionID: string,
   turnID: string | null = null,
-  model = "unknown",
+  model: any = "unknown",
   clientInstanceId = CLIENT_INSTANCE_ID
 ): Promise<boolean> {
   activeSessionId = sessionID;
   if (turnID) {
     activeTurnId = turnID;
   }
-  const isDeepSeek = Boolean(model && (model.toLowerCase().includes("deepseek") || model.toLowerCase().startsWith("deepseek")));
-  const provider_id = isDeepSeek ? "deepseek_direct" : (model === "unknown" ? "unknown" : "other");
+  const modelStr = typeof model === "string" ? model : (model?.id || "unknown");
+  const isDeepSeek = Boolean(modelStr && (modelStr.toLowerCase().includes("deepseek") || modelStr.toLowerCase().startsWith("deepseek")));
+  const provider_id = isDeepSeek ? "deepseek_direct" : (modelStr === "unknown" ? "unknown" : "other");
   const res = await sendControlRequest("/api/v1/sessions/register", "POST", {
     session_id: sessionID,
     client_type: "pi",
     client_instance_id: clientInstanceId,
     turn_id: turnID,
-    model,
+    model: modelStr,
     provider_id,
     is_active: true,
   });
@@ -306,25 +307,57 @@ export default function peakguardExtension(pi: any) {
   if (typeof pi?.on === "function") {
     pi.on("session_start", (_event: any, ctx: any) => {
       activeCtx = ctx;
-      activeSessionId = ctx?.sessionId || ctx?.id || "pi-session";
-      if (ctx?.model) currentModel = ctx.model;
+      try {
+        if (ctx?.sessionManager?.getSessionId) {
+          activeSessionId = ctx.sessionManager.getSessionId() || activeSessionId;
+        } else if (ctx?.sessionId) {
+          activeSessionId = ctx.sessionId;
+        }
+      } catch {}
+      if (ctx?.model) {
+        currentModel = typeof ctx.model === "string" ? ctx.model : (ctx.model?.id || "unknown");
+      }
       updateStatusDisplay();
     });
 
     pi.on("agent_start", (_event: any, ctx: any) => {
       activeCtx = ctx;
-      activeSessionId = ctx?.sessionId || ctx?.id || activeSessionId;
-      if (ctx?.model) currentModel = ctx.model;
+      try {
+        if (ctx?.sessionManager?.getSessionId) {
+          activeSessionId = ctx.sessionManager.getSessionId() || activeSessionId;
+        } else if (ctx?.sessionId) {
+          activeSessionId = ctx.sessionId;
+        }
+      } catch {}
+      if (ctx?.model) {
+        currentModel = typeof ctx.model === "string" ? ctx.model : (ctx.model?.id || "unknown");
+      }
       updateStatusDisplay();
     });
 
-    pi.on("turn_start", async (_event: any, ctx: any) => {
+    pi.on("turn_start", async (event: any, ctx: any) => {
       activeCtx = ctx;
-      activeTurnId = ctx?.turnId || ctx?.id || `turn-${Date.now()}`;
-      activeSessionId = ctx?.sessionId || ctx?.id || activeSessionId;
-      if (ctx?.model) {
-        currentModel = ctx.model;
+      try {
+        if (ctx?.sessionManager?.getSessionId) {
+          activeSessionId = ctx.sessionManager.getSessionId() || activeSessionId;
+        } else if (ctx?.sessionId) {
+          activeSessionId = ctx.sessionId;
+        }
+      } catch {}
+
+      if (event?.turnIndex !== undefined) {
+        activeTurnId = `turn-${event.turnIndex}`;
+      } else if (ctx?.turnId) {
+        activeTurnId = ctx.turnId;
+      } else if (!activeTurnId) {
+        activeTurnId = `turn-${Date.now()}`;
       }
+
+      if (ctx?.model) {
+        currentModel = typeof ctx.model === "string" ? ctx.model : (ctx.model?.id || "unknown");
+      }
+
+      console.info(`[PeakGuard:Pi] turn_start: session='${activeSessionId}', turn='${activeTurnId}', model='${currentModel}'`);
       await registerActiveSession(activeSessionId, activeTurnId, currentModel);
       startHeartbeat();
     });
@@ -345,13 +378,21 @@ export default function peakguardExtension(pi: any) {
 
   // 2. Actualizar indicador en UI con verificación rigurosa de cobertura (T18.1.1)
   async function updateStatusDisplay() {
-    const status = await getPeakGuardStatus();
-    const label = formatPiStatusLabel(status);
+    try {
+      const status = await getPeakGuardStatus();
+      const label = formatPiStatusLabel(status);
 
-    if (activeCtx?.ui?.setStatus) {
-      activeCtx.ui.setStatus("peakguard", label);
-    } else if (pi?.ui?.setStatus) {
-      pi.ui.setStatus("peakguard", label);
+      try {
+        if (activeCtx?.hasUI && activeCtx?.ui?.setStatus) {
+          activeCtx.ui.setStatus("peakguard", label);
+        } else if (pi?.ui?.setStatus) {
+          pi.ui.setStatus("peakguard", label);
+        }
+      } catch {
+        // UI puede no estar disponible en modo headless o CLI
+      }
+    } catch {
+      // Ignorar fallos de red al actualizar estado
     }
   }
 

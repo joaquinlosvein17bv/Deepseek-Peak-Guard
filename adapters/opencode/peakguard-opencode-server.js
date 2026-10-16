@@ -466,6 +466,7 @@ export function startEventSubscriber(client) {
  * Hook de servidor (V1/V2 server plugin para OpenCode 1.18.35+)
  */
 export const PeakGuardServerPlugin = async (input) => {
+  console.error('[PEAKGUARD_PLUGIN_BOOTSTRAPPED]');
   const client = input?.client;
   startEventSubscriber(client);
 
@@ -474,8 +475,8 @@ export const PeakGuardServerPlugin = async (input) => {
       const type = event?.type;
       const properties = event?.properties ?? {};
       const sessionID = properties?.sessionID || properties?.info?.id;
-      const model = properties?.info?.model || properties?.model || "unknown";
-      let provider = properties?.provider || properties?.info?.provider || "unknown";
+      const model = properties?.info?.model?.modelID || properties?.info?.model || properties?.model || "unknown";
+      let provider = properties?.info?.model?.providerID || properties?.provider || properties?.info?.provider || "unknown";
       if (provider === "unknown" && typeof model === "string" && model.toLowerCase().includes("deepseek")) {
         provider = "deepseek_direct";
       }
@@ -484,8 +485,25 @@ export const PeakGuardServerPlugin = async (input) => {
         await registerActiveSession(sessionID, model, provider);
       }
 
+      // Registro estricto de turno en message.updated o message.created (T18.3.1)
+      if (type === "message.updated" && sessionID && properties?.info?.id) {
+        const turnID = properties.info.id;
+        const msgModel = properties?.info?.model?.modelID || (typeof model === "string" ? model : "unknown");
+        const msgProvider = properties?.info?.model?.providerID || provider;
+        await registerActiveSession(sessionID, msgModel, msgProvider, turnID);
+        await sendSessionHeartbeat(sessionID, turnID, true);
+      }
+
       if (type === "message.created" && sessionID) {
         await sendSessionHeartbeat(sessionID, properties?.messageId, true);
+      }
+
+      if (type === "session.status" && sessionID) {
+        const isBusy = properties?.status?.type === "busy";
+        if (!isBusy) {
+          const sess = activeSessions.get(sessionID);
+          await sendSessionHeartbeat(sessionID, sess?.turnID || null, false);
+        }
       }
 
       if ((type === "message.completed" || type === "session.idle") && sessionID) {
@@ -499,7 +517,65 @@ export const PeakGuardServerPlugin = async (input) => {
   };
 };
 
-export default {
-  id: "peakguard.opencode.server",
-  server: PeakGuardServerPlugin,
+/**
+ * Hook de configuración V2 para OpenCode (2.0+)
+ */
+export const PeakGuardSetupPlugin = async (ctx) => {
+  const controller = new AbortController();
+  const client = {
+    session: {
+      abort: async (input, options) => {
+        if (ctx?.session?.abort) {
+          return ctx.session.abort(input, options);
+        }
+        return { aborted: false };
+      },
+      get: async (input, options) => {
+        if (ctx?.session?.get) {
+          return ctx.session.get(input, options);
+        }
+        return null;
+      },
+    },
+  };
+
+  const hooks = await PeakGuardServerPlugin({ client });
+
+  const running = (async () => {
+    try {
+      if (ctx?.event?.subscribe) {
+        for await (const input of ctx.event.subscribe({ signal: controller.signal })) {
+          if (controller.signal.aborted) break;
+          const type = input.type;
+          let properties = input.data || input.properties || {};
+          if (type === "session.created") {
+            properties = { ...properties, sessionID: properties.sessionID || properties.id };
+          }
+          if (hooks?.event) {
+            await hooks.event({ event: { type, properties } });
+          }
+        }
+      }
+    } catch {
+      // Subscripción abortada limpiamente
+    }
+  })();
+
+  return async () => {
+    controller.abort();
+    await running;
+  };
 };
+
+const PeakGuardPlugin = async function (input) {
+  if (input && typeof input.session === "object" && typeof input.event === "object") {
+    return PeakGuardSetupPlugin(input);
+  }
+  return PeakGuardServerPlugin(input);
+};
+
+PeakGuardPlugin.id = "peakguard.opencode.server";
+PeakGuardPlugin.server = PeakGuardServerPlugin;
+PeakGuardPlugin.setup = PeakGuardSetupPlugin;
+
+export default PeakGuardPlugin;
